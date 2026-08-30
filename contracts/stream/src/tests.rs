@@ -1466,3 +1466,134 @@ fn sender_still_can_pause_after_setting_operator() {
 // satisfy this auth because they are not the recipient. This is already covered
 // by the existing withdraw tests (which always pass recipient auth) and would
 // require disabling mock_all_auths() to test negative cases properly.
+// ── State storage: save() writes only Config; legacy keys are cleaned ─────────
+//
+// `save()` used to mirror the 9 individual per-field keys alongside the
+// consolidated `Config` on every mutation, but `load()` reads `Config` on its
+// fast path (always true for post-consolidation streams). Those mirrors were
+// never read — pure write/rent overhead on every state mutation. `save()` now
+// writes only `Config` and, on the first `save()` of a pre-consolidation
+// stream, removes the legacy keys one-time.
+
+#[test]
+fn initialize_writes_only_config_and_not_legacy_keys() {
+    let s = Setup::new(100, 3600, false);
+
+    let (has_config, has_sender, has_withdrawn, has_flags) =
+        s.env.as_contract(&s.client.address, || {
+            let storage = s.env.storage().instance();
+            (
+                storage.has(&DataKey::Config),
+                storage.has(&DataKey::Sender),
+                storage.has(&DataKey::Withdrawn),
+                storage.has(&DataKey::Flags),
+            )
+        });
+
+    assert!(
+        has_config,
+        "consolidated Config must be written on initialize"
+    );
+    assert!(!has_sender, "legacy Sender key must not be written");
+    assert!(!has_withdrawn, "legacy Withdrawn key must not be written");
+    assert!(!has_flags, "legacy Flags key must not be written");
+
+    // initialize() must still expose the full state via load()/info().
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+    assert_eq!(info.rate_per_second, 100);
+    assert!(!info.is_clawback_enabled());
+}
+
+#[test]
+fn state_mutation_writes_only_config_not_legacy_keys() {
+    let s = Setup::new(100, 3600, false);
+    s.advance_secs(100);
+    s.client.withdraw(&10_000); // drives state::save
+
+    let (has_config, has_sender, has_withdrawn) = s.env.as_contract(&s.client.address, || {
+        let storage = s.env.storage().instance();
+        (
+            storage.has(&DataKey::Config),
+            storage.has(&DataKey::Sender),
+            storage.has(&DataKey::Withdrawn),
+        )
+    });
+    assert!(has_config, "Config must be present after a mutation");
+    assert!(
+        !has_sender,
+        "mutation must not resurrect the legacy Sender key"
+    );
+    assert!(
+        !has_withdrawn,
+        "mutation must not resurrect the legacy Withdrawn key"
+    );
+
+    // The mutation's effect must still be durable through Config.
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+    assert_eq!(info.withdrawn, 10_000);
+}
+
+#[test]
+fn save_migrates_legacy_keys_to_config_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let stream_id = env.register_contract(None, DripStream);
+
+    // Simulate a pre-consolidation stream: only the per-field keys exist.
+    env.as_contract(&stream_id, || {
+        let storage = env.storage().instance();
+        storage.set(&DataKey::Sender, &sender);
+        storage.set(&DataKey::Recipient, &recipient);
+        storage.set(&DataKey::Token, &token_addr);
+        storage.set(&DataKey::RatePerSecond, &100_i128);
+        storage.set(&DataKey::StartTime, &1_000_000_u64);
+        storage.set(&DataKey::EndTime, &1_003_600_u64);
+        storage.set(&DataKey::Withdrawn, &0_i128);
+        storage.set(&DataKey::PausedAt, &0_u64);
+        storage.set(&DataKey::Flags, &0_u32);
+        assert!(!storage.has(&DataKey::Config));
+    });
+
+    // First save() supersedes the legacy keys and writes Config.
+    env.as_contract(&stream_id, || {
+        crate::state::save(
+            &env,
+            &crate::storage::StreamInfo {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token: token_addr.clone(),
+                rate_per_second: 100,
+                start_time: 1_000_000,
+                end_time: 1_003_600,
+                withdrawn: 0,
+                paused_at: 0,
+                flags: 0,
+            },
+        );
+    });
+
+    // Legacy keys removed, Config present, load() returns the right state.
+    env.as_contract(&stream_id, || {
+        let storage = env.storage().instance();
+        assert!(storage.has(&DataKey::Config));
+        assert!(!storage.has(&DataKey::Sender));
+        assert!(!storage.has(&DataKey::Recipient));
+        assert!(!storage.has(&DataKey::Withdrawn));
+        assert!(!storage.has(&DataKey::Flags));
+
+        let info = crate::state::load(&env);
+        assert_eq!(info.rate_per_second, 100);
+        assert_eq!(info.sender, sender);
+        assert_eq!(info.recipient, recipient);
+    });
+}
