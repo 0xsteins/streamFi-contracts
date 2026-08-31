@@ -404,7 +404,11 @@ impl DripStream {
         let tk = token::Client::new(env, &info.token);
         let contract_addr = env.current_contract_address();
 
-        tk.transfer(&info.sender, &contract_addr, &amount);
+        // Funds come from whichever party was just authorized above (sender
+        // or operator), not always `info.sender`: SEP-41 `transfer` requires
+        // the `from` address's own auth, which an operator acting alone
+        // cannot supply on the sender's behalf.
+        tk.transfer(caller, &contract_addr, &amount);
 
         let new_balance = tk.balance(&contract_addr);
         events::topped_up(env, caller, amount, new_balance);
@@ -414,7 +418,7 @@ impl DripStream {
     /// Sender (or operator) extends the stream duration by `extra_time_seconds`.
     ///
     /// Transfers the exact required deposit (rate_per_second × extra_time_seconds)
-    /// from the sender into the contract and updates `end_time`.
+    /// from the caller into the contract and updates `end_time`.
     ///
     /// # Governance Duration Bounds Design Note
     ///
@@ -459,8 +463,9 @@ impl DripStream {
         let tk = token::Client::new(env, &info.token);
         let contract_addr = env.current_contract_address();
 
-        // Transfer required deposit from sender into the contract
-        tk.transfer(&info.sender, &contract_addr, &required_deposit);
+        // Transfer required deposit from the caller (sender or operator) into
+        // the contract. See `_top_up` for why this isn't always `info.sender`.
+        tk.transfer(caller, &contract_addr, &required_deposit);
 
         // Update end_time with overflow check
         end_time = end_time
@@ -534,8 +539,9 @@ impl DripStream {
         let tk = token::Client::new(env, &info.token);
         let contract_addr = env.current_contract_address();
 
-        // Transfer funds from sender into the contract
-        tk.transfer(&info.sender, &contract_addr, &amount);
+        // Transfer funds from the caller (sender or operator) into the
+        // contract. See `_top_up` for why this isn't always `info.sender`.
+        tk.transfer(caller, &contract_addr, &amount);
 
         // Update end_time with overflow check
         let new_end_time = info
@@ -694,6 +700,12 @@ impl DripStream {
     ///
     /// Only the sender may call this. The operator has no power over
     /// withdrawals (which are recipient-only) or recipient transfers.
+    ///
+    /// Note: `top_up`, `extend_duration`, and `top_up_and_extend` debit
+    /// whichever party actually calls them, not always `info.sender` — SEP-41
+    /// transfers require the `from` address's own auth, which the operator
+    /// cannot supply on the sender's behalf. So an operator funding these
+    /// calls deposits from their own balance rather than the sender's.
     pub fn set_operator(env: Env, caller: Address, operator: Address) -> Result<(), Error> {
         let info = state::load(&env);
         state::assert_not_cancelled(&info)?;
