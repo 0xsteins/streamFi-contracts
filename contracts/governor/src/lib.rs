@@ -21,6 +21,7 @@ mod errors;
 mod events;
 mod role;
 mod storage;
+mod tests;
 mod ttl;
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, Symbol, Vec};
