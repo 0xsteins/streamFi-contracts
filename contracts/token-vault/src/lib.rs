@@ -129,6 +129,9 @@ impl TokenVault {
         if new_balance > max {
             return Err(Error::LimitExceeded);
         }
+        if new_balance != expected_balance {
+            return Err(Error::DepositTransferFailed);
+        }
 
         bump_instance(&env);
         events::deposited(&env, &from, amount, new_balance);
@@ -145,12 +148,16 @@ impl TokenVault {
         }
 
         let balance = vault_balance(&env)?;
-        let new_balance = balance
+        let expected_balance = balance
             .checked_sub(amount)
             .ok_or(Error::ArithmeticOverflow)?;
 
         let tk = token_client(&env)?;
         tk.transfer(&env.current_contract_address(), &to, &amount);
+        let new_balance = vault_balance(&env)?;
+        if new_balance != expected_balance {
+            return Err(Error::DepositTransferFailed);
+        }
 
         bump_instance(&env);
         events::withdrawn(&env, &caller, &to, amount, new_balance);
