@@ -1489,10 +1489,11 @@ fn operator_can_extend_duration() {
     s.client.set_operator(&s.sender, &operator);
 
     let before_end = s.client.info().end_time;
-    // Mint the required deposit (100s × rate 100 = 10_000) to the sender so
-    // the token transfer inside extend_duration succeeds.
+    // extend_duration transfers the required deposit (100s × rate 100 =
+    // 10_000) from the *caller* — here the operator — so fund the operator
+    // (see _extend_duration / #431).
     let token_admin = token::StellarAssetClient::new(&s.env, &s.token.address);
-    token_admin.mint(&s.sender, &10_000);
+    token_admin.mint(&operator, &10_000);
 
     let contract_before = s.token.balance(&s.client.address);
     s.client.extend_duration(&operator, &100);

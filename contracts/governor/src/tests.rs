@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{symbol_short, testutils::{Address as _, Events as _}, Address, Env, IntoVal};
 
 fn create_test_env() -> (Env, Address, Address, Address) {
     let env = Env::default();
@@ -23,10 +23,10 @@ fn test_set_fee_bps_accepts_valid_values() {
     client.initialize(&authority, &fee_recipient, &factory_address);
     
     // Test valid fee values
-    assert!(client.set_fee_bps(&authority, &0).is_ok());
-    assert!(client.set_fee_bps(&authority, &100).is_ok());
-    assert!(client.set_fee_bps(&authority, &5000).is_ok());
-    assert!(client.set_fee_bps(&authority, &10_000).is_ok()); // Exactly 100%
+    assert!(client.try_set_fee_bps(&authority, &0).is_ok());
+    assert!(client.try_set_fee_bps(&authority, &100).is_ok());
+    assert!(client.try_set_fee_bps(&authority, &5000).is_ok());
+    assert!(client.try_set_fee_bps(&authority, &10_000).is_ok()); // Exactly 100%
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn test_set_fee_bps_boundary_values() {
     client.initialize(&authority, &fee_recipient, &factory_address);
     
     // Boundary test: 10,000 should succeed (exactly 100%)
-    assert!(client.set_fee_bps(&authority, &10_000).is_ok());
+    assert!(client.try_set_fee_bps(&authority, &10_000).is_ok());
     
     // Boundary test: 10,001 should fail (over 100%)
     let result = client.try_set_fee_bps(&authority, &10_001);
@@ -79,11 +79,11 @@ fn test_set_fee_bps_emits_event() {
     client.set_fee_bps(&authority, &500);
     
     let events = env.events().all();
-    let event = events.last().unwrap();
-    
+    let (_, topics, _data) = events.last().unwrap();
+
     assert_eq!(
-        event.topics,
-        (symbol_short!("fee_bps"), authority.clone())
+        topics,
+        (symbol_short!("fee_bps"), authority.clone()).into_val(&env)
     );
 }
 
@@ -112,7 +112,7 @@ fn test_set_fee_bps_blocked_when_paused() {
     client.initialize(&authority, &fee_recipient, &factory_address);
     
     // Pause the governor
-    client.governor_pause(&authority).unwrap();
+    client.governor_pause(&authority);
     
     // Should fail when paused
     let result = client.try_set_fee_bps(&authority, &100);
