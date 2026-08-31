@@ -608,12 +608,12 @@ impl DripStream {
     }
 
     /// Read-only: current withdrawable balance for the recipient.
-    pub fn withdrawable(env: Env) -> i128 {
+    pub fn withdrawable(env: Env) -> Result<i128, Error> {
         let info = state::load(&env);
         if info.is_cancelled() {
-            return 0;
+            return Ok(0);
         }
-        math::withdrawable(&env, &info).unwrap_or(0)
+        math::withdrawable(&env, &info)
     }
 
     /// Read-only: whether clawback is enabled for this stream.
@@ -775,12 +775,12 @@ impl DripStream {
     ///
     /// Useful for UIs that want to show "X streamed, Y withdrawn, Z remaining"
     /// without the caller needing to reimplement the rate × elapsed math.
-    pub fn streamed_total(env: Env) -> i128 {
+    pub fn streamed_total(env: Env) -> Result<i128, Error> {
         let info = state::load(&env);
         if info.is_cancelled() {
-            return 0;
+            return Ok(0);
         }
-        math::streamed_amount(&env, &info).unwrap_or(0)
+        math::streamed_amount(&env, &info)
     }
 
     /// Read-only: full stream state.
