@@ -1169,15 +1169,40 @@ fn set_operator_rejects_on_cancelled_stream() {
 }
 
 #[test]
-fn set_operator_requires_revoke_before_replacement() {
+fn set_operator_replaces_existing_operator_atomically() {
+    // Issue #417: set_operator should replace an existing operator in one call,
+    // allowing atomic key rotation without a no-operator gap.
     let s = Setup::new(100, 3600, false);
     let op1 = Address::generate(&s.env);
     let op2 = Address::generate(&s.env);
+    
+    // Set initial operator
     s.client.set_operator(&s.sender, &op1);
     assert_eq!(s.client.operator(), Some(op1.clone()));
-    let result = s.client.try_set_operator(&s.sender, &op2);
-    assert_eq!(result, Err(Ok(Error::OperatorAlreadySet)));
-    assert_eq!(s.client.operator(), Some(op1));
+    
+    // Replace with a different operator - should succeed now
+    s.client.set_operator(&s.sender, &op2);
+    assert_eq!(s.client.operator(), Some(op2.clone()));
+    
+    // Verify we can replace again
+    let op3 = Address::generate(&s.env);
+    s.client.set_operator(&s.sender, &op3);
+    assert_eq!(s.client.operator(), Some(op3.clone()));
+}
+
+#[test]
+fn set_operator_is_idempotent_for_same_address() {
+    // Issue #417: Setting the same operator twice should be idempotent.
+    // The early return keeps this operation idempotent.
+    let s = Setup::new(100, 3600, false);
+    let operator = Address::generate(&s.env);
+    
+    s.client.set_operator(&s.sender, &operator);
+    assert_eq!(s.client.operator(), Some(operator.clone()));
+    
+    // Setting the same operator again should succeed without error
+    s.client.set_operator(&s.sender, &operator);
+    assert_eq!(s.client.operator(), Some(operator));
 }
 
 #[test]

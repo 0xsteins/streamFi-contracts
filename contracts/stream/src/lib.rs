@@ -728,12 +728,17 @@ impl DripStream {
             .instance()
             .get::<_, Address>(&DataKey::Operator)
         {
-            if existing != operator {
-                return Err(Error::OperatorAlreadySet);
+            // Issue #417: If the new operator is the same, it's idempotent — return early.
+            // If different, replace atomically: revoke the old one, then set the new one.
+            // This allows key rotation in a single transaction without a no-operator gap.
+            if existing == operator {
+                return Ok(());
             }
-            return Ok(());
+            // Revoke the old operator
+            events::operator_revoked(&env, &caller);
         }
 
+        // Set the new operator
         env.storage().instance().set(&DataKey::Operator, &operator);
         events::operator_set(&env, &caller, &operator);
         Ok(())
