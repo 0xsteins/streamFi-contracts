@@ -35,10 +35,11 @@ pub enum DataKey {
     /// Replaces the 11 individual keys above for new writes — loaded in one
     /// storage read instead of eleven.
     Config,
-    /// Monotonic identifier attached to every contract event.
+    /// Legacy standalone copy of the current event sequence value.
     ///
-    /// Consumers compare this value with the last sequence they processed
-    /// after reconnecting so missing ledger events cannot go unnoticed.
+    /// New writes persist this as part of `StreamInfo`/`Config` so it survives
+    /// consolidated-key migrations. Older streams may still have this key until
+    /// the first `save()` migrates them to the single-key layout.
     EventSequence,
     /// Lock for re-entrancy protection and concurrency control.
     Guard,
@@ -76,6 +77,7 @@ pub struct StreamInfo {
     pub withdrawn: i128,
     pub paused_at: u64,
     pub flags: u32,
+    pub event_sequence: u64,
 }
 
 impl StreamInfo {

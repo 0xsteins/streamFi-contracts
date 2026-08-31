@@ -285,6 +285,151 @@ fn clawback_disabled_panics() {
     assert_eq!(result, Err(Ok(Error::ClawbackDisabled)));
 }
 
+/// Regression test for #458.
+///
+/// Open-ended streams (`end_time == 0`) accrue indefinitely while their
+/// funded balance is finite. `clawback` must refund exactly the unstreamed
+/// remainder (balance − accrued-but-unwithdrawn) and must never touch the
+/// portion that has already accrued to the recipient.
+#[test]
+fn clawback_open_ended_refunds_unstreamed_remainder() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let tok = token::Client::new(&env, &token_addr);
+    let tok_admin = token::StellarAssetClient::new(&env, &token_addr);
+
+    // rate = 100 stroops/s; deposit = 10_000 stroops → funds 100 s of streaming.
+    let rate: i128 = 100;
+    let deposit: i128 = 10_000;
+    let now: u64 = 1_000_000;
+
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 21,
+        sequence_number: 1,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl: 6_312_000,
+    });
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    tok_admin.mint(&sender, &deposit);
+    tok.transfer(&sender, &stream_id, &deposit);
+
+    client.initialize(
+        &sender,
+        &recipient,
+        &token_addr,
+        &rate,
+        &now,
+        &0, // open-ended — no end_time
+        &true,
+    );
+
+    // Advance 30 s → 3_000 stroops have accrued to the recipient.
+    env.ledger().set(LedgerInfo {
+        timestamp: now + 30,
+        ..env.ledger().get()
+    });
+
+    let accrued: i128 = rate * 30; // 3_000
+    let expected_refund = deposit - accrued; // 7_000
+
+    let sender_before = tok.balance(&sender);
+    let reclaimed = client.clawback(&sender);
+
+    // Clawback returns exactly the unstreamed remainder.
+    assert_eq!(reclaimed, expected_refund);
+    // Sender's wallet grew by the same amount.
+    assert_eq!(tok.balance(&sender) - sender_before, expected_refund);
+    // Accrued balance is still in the contract, available to the recipient.
+    assert_eq!(tok.balance(&stream_id), accrued);
+}
+
+/// Regression test for #458 — second invariant.
+///
+/// After a clawback on an open-ended stream the recipient can still
+/// withdraw every stroop that had already accrued before the clawback,
+/// but cannot withdraw more.
+#[test]
+fn clawback_open_ended_does_not_touch_accrued_funds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let tok = token::Client::new(&env, &token_addr);
+    let tok_admin = token::StellarAssetClient::new(&env, &token_addr);
+
+    let rate: i128 = 100;
+    let deposit: i128 = 10_000;
+    let now: u64 = 1_000_000;
+
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 21,
+        sequence_number: 1,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl: 6_312_000,
+    });
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    tok_admin.mint(&sender, &deposit);
+    tok.transfer(&sender, &stream_id, &deposit);
+
+    client.initialize(
+        &sender,
+        &recipient,
+        &token_addr,
+        &rate,
+        &now,
+        &0, // open-ended
+        &true,
+    );
+
+    // Advance 50 s → 5_000 stroops accrued.
+    env.ledger().set(LedgerInfo {
+        timestamp: now + 50,
+        ..env.ledger().get()
+    });
+
+    let accrued: i128 = rate * 50; // 5_000
+
+    // Sender claws back the unstreamed half.
+    client.clawback(&sender);
+
+    // Time is frozen; withdrawable must equal the full accrued amount.
+    assert_eq!(client.withdrawable(), accrued);
+
+    // Recipient can withdraw every accrued stroop.
+    let withdrawn = client.withdraw(&accrued);
+    assert_eq!(withdrawn, accrued);
+    assert_eq!(tok.balance(&recipient), accrued);
+
+    // Nothing left to withdraw.
+    assert_eq!(client.withdrawable(), 0);
+}
+
 // ── Top-up ────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1176,15 +1321,40 @@ fn set_operator_rejects_on_cancelled_stream() {
 }
 
 #[test]
-fn set_operator_requires_revoke_before_replacement() {
+fn set_operator_replaces_existing_operator_atomically() {
+    // Issue #417: set_operator should replace an existing operator in one call,
+    // allowing atomic key rotation without a no-operator gap.
     let s = Setup::new(100, 3600, false);
     let op1 = Address::generate(&s.env);
     let op2 = Address::generate(&s.env);
+
+    // Set initial operator
     s.client.set_operator(&s.sender, &op1);
     assert_eq!(s.client.operator(), Some(op1.clone()));
-    let result = s.client.try_set_operator(&s.sender, &op2);
-    assert_eq!(result, Err(Ok(Error::OperatorAlreadySet)));
-    assert_eq!(s.client.operator(), Some(op1));
+
+    // Replace with a different operator - should succeed now
+    s.client.set_operator(&s.sender, &op2);
+    assert_eq!(s.client.operator(), Some(op2.clone()));
+
+    // Verify we can replace again
+    let op3 = Address::generate(&s.env);
+    s.client.set_operator(&s.sender, &op3);
+    assert_eq!(s.client.operator(), Some(op3.clone()));
+}
+
+#[test]
+fn set_operator_is_idempotent_for_same_address() {
+    // Issue #417: Setting the same operator twice should be idempotent.
+    // The early return keeps this operation idempotent.
+    let s = Setup::new(100, 3600, false);
+    let operator = Address::generate(&s.env);
+
+    s.client.set_operator(&s.sender, &operator);
+    assert_eq!(s.client.operator(), Some(operator.clone()));
+
+    // Setting the same operator again should succeed without error
+    s.client.set_operator(&s.sender, &operator);
+    assert_eq!(s.client.operator(), Some(operator));
 }
 
 #[test]
@@ -1317,6 +1487,26 @@ fn operator_passes_auth_gate_for_top_up() {
 
     let result = s.client.try_top_up(&operator, &1_000);
     assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn operator_can_extend_duration() {
+    let s = Setup::new(100, 3_600, false);
+    let operator = Address::generate(&s.env);
+    s.client.set_operator(&s.sender, &operator);
+
+    let before_end = s.client.info().end_time;
+    // extend_duration transfers the required deposit (100s × rate 100 =
+    // 10_000) from the *caller* — here the operator — so fund the operator
+    // (see _extend_duration / #431).
+    let token_admin = token::StellarAssetClient::new(&s.env, &s.token.address);
+    token_admin.mint(&operator, &10_000);
+
+    let contract_before = s.token.balance(&s.client.address);
+    s.client.extend_duration(&operator, &100);
+
+    assert_eq!(s.client.info().end_time, before_end + 100);
+    assert_eq!(s.token.balance(&s.client.address), contract_before + 10_000);
 }
 
 #[test]
@@ -1560,6 +1750,40 @@ fn initialize_writes_only_config_and_not_legacy_keys() {
 }
 
 #[test]
+fn event_sequence_is_persisted_in_config_and_not_left_as_legacy_state() {
+    let s = Setup::new(100, 3600, false);
+    s.advance_secs(100);
+    s.client.pause(&s.sender);
+    s.client.resume(&s.sender);
+
+    let (has_config, has_event_sequence) = s.env.as_contract(&s.client.address, || {
+        let storage = s.env.storage().instance();
+        (
+            storage.has(&DataKey::Config),
+            storage.has(&DataKey::EventSequence),
+        )
+    });
+
+    assert!(
+        has_config,
+        "Config must be present after event-driven updates"
+    );
+    assert!(
+        !has_event_sequence,
+        "EventSequence must be stored in Config rather than as a standalone legacy key"
+    );
+
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+    assert_eq!(
+        info.event_sequence, 3,
+        "pause/resume emits two events after init"
+    );
+    assert_eq!(s.client.event_sequence(), 3);
+}
+
+#[test]
 fn state_mutation_writes_only_config_not_legacy_keys() {
     let s = Setup::new(100, 3600, false);
     s.advance_secs(100);
@@ -1631,6 +1855,7 @@ fn save_migrates_legacy_keys_to_config_once() {
                 withdrawn: 0,
                 paused_at: 0,
                 flags: 0,
+                event_sequence: 0,
             },
         );
     });

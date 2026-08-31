@@ -21,6 +21,7 @@ mod errors;
 mod events;
 mod role;
 mod storage;
+mod tests;
 mod ttl;
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, Symbol, Vec};
@@ -450,6 +451,11 @@ impl DripGovernor {
         }
         assert_not_paused(&env)?;
         role::require_role_or_admin(&env, &caller, Role::RateManager)?;
+        let old_min_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinDurationSeconds)
+            .unwrap_or(3600);
         let max_duration: u64 = env
             .storage()
             .instance()
@@ -468,7 +474,7 @@ impl DripGovernor {
         env.storage()
             .instance()
             .set(&DataKey::MinDurationSeconds, &seconds);
-        events::set_min_duration(&env, &caller, seconds);
+        events::set_min_duration(&env, &caller, old_min_duration, seconds);
         Ok(())
     }
 
@@ -478,6 +484,11 @@ impl DripGovernor {
         }
         assert_not_paused(&env)?;
         role::require_role_or_admin(&env, &caller, Role::RateManager)?;
+        let old_max_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxRatePerSecond)
+            .unwrap_or(1_000_000_000_000_000);
         let min_duration: u64 = env
             .storage()
             .instance()
@@ -488,7 +499,7 @@ impl DripGovernor {
         env.storage()
             .instance()
             .set(&DataKey::MaxRatePerSecond, &max_rate);
-        events::set_max_rate(&env, &caller, max_rate);
+        events::set_max_rate(&env, &caller, old_max_rate, max_rate);
         Ok(())
     }
 
@@ -498,6 +509,11 @@ impl DripGovernor {
         }
         assert_not_paused(&env)?;
         role::require_role_or_admin(&env, &caller, Role::RateManager)?;
+        let old_max_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxDurationSeconds)
+            .unwrap_or(315_360_000);
         let min_duration: u64 = env
             .storage()
             .instance()
@@ -509,7 +525,7 @@ impl DripGovernor {
         env.storage()
             .instance()
             .set(&DataKey::MaxDurationSeconds, &seconds);
-        events::set_max_duration(&env, &caller, seconds);
+        events::set_max_duration(&env, &caller, old_max_duration, seconds);
         Ok(())
     }
 
