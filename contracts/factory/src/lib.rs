@@ -113,7 +113,8 @@ impl DripFactory {
         if deposit < rate_per_sec {
             return Err(Error::InsufficientDeposit);
         }
-        if start_time < env.ledger().timestamp() {
+        let now = env.ledger().timestamp();
+        if start_time < now {
             return Err(Error::BackdatedStream);
         }
         // A fixed-duration stream must be funded for its entire declared
@@ -136,7 +137,7 @@ impl DripFactory {
             .get(&DataKey::GovernorAddress)
             .ok_or(Error::NotInitialized)?;
         let config = governance::config(&env, &governor)?;
-        governance::enforce_bounds(&config, rate_per_sec, start_time, end_time)?;
+        governance::enforce_bounds(&config, rate_per_sec, start_time, end_time, now)?;
 
         // ── Reentrancy guard ─────────────────────────────────────────────
         // `token` is caller-supplied and may not be a well-behaved SEP-41
