@@ -560,6 +560,10 @@ impl DripStream {
     }
 
     /// Sender reclaims unstreamed tokens (only if clawback was enabled).
+    ///
+    /// A paused stream must be resumed before clawback is allowed; otherwise the
+    /// sender could freeze accrual and immediately drain the remaining principal
+    /// while the recipient is effectively blocked from earning any more funds.
     pub fn clawback(env: Env, caller: Address) -> Result<i128, Error> {
         state::with_guard(&env, |env| Self::_clawback(env, &caller))
     }
@@ -569,6 +573,9 @@ impl DripStream {
 
         let info = state::load(env);
         state::assert_not_cancelled(&info)?;
+        if info.is_paused() {
+            return Err(Error::NotPaused);
+        }
         if !info.is_clawback_enabled() {
             return Err(Error::ClawbackDisabled);
         }
