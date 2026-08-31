@@ -1313,6 +1313,25 @@ fn operator_passes_auth_gate_for_top_up() {
 }
 
 #[test]
+fn operator_can_extend_duration() {
+    let s = Setup::new(100, 3_600, false);
+    let operator = Address::generate(&s.env);
+    s.client.set_operator(&s.sender, &operator);
+
+    let before_end = s.client.info().end_time;
+    // Mint the required deposit (100s × rate 100 = 10_000) to the sender so
+    // the token transfer inside extend_duration succeeds.
+    let token_admin = token::StellarAssetClient::new(&s.env, &s.token.address);
+    token_admin.mint(&s.sender, &10_000);
+
+    let contract_before = s.token.balance(&s.client.address);
+    s.client.extend_duration(&operator, &100);
+
+    assert_eq!(s.client.info().end_time, before_end + 100);
+    assert_eq!(s.token.balance(&s.client.address), contract_before + 10_000);
+}
+
+#[test]
 fn operator_passes_auth_gate_for_extend_duration() {
     // extend_duration transfers tokens FROM the sender via tk.transfer.
     // Same auth limitation as top_up — verify the operator clears the gate
