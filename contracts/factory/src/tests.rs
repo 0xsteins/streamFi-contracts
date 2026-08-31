@@ -9,7 +9,7 @@ use soroban_sdk::{
     Address, BytesN, Env,
 };
 
-use crate::{DripFactory, DripFactoryClient, Error};
+use crate::{storage::DataKey, DripFactory, DripFactoryClient, Error};
 
 /// Register a factory and initialize it with a dummy stream WASM hash and a
 /// freshly generated governor. Auth is mocked, so the governor-gated
@@ -245,6 +245,88 @@ fn upgrade_blocked_while_paused_then_allowed_after_unpause() {
     );
 }
 
+// ── Legacy index migration (#383) ─────────────────────────────────────────
+
+#[test]
+fn legacy_sender_index_migration_is_incremental() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+
+    s.env.as_contract(&s.client.address, || {
+        let mut legacy = soroban_sdk::Vec::new(&s.env);
+        for id in 0..250_u64 {
+            legacy.push_back(id);
+        }
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BySender(sender.clone()), &legacy);
+    });
+
+    assert_eq!(s.client.stream_count_by_sender(&sender), 250);
+    assert_eq!(s.client.migrate_sender_index(&sender, &1), 100);
+
+    s.env.as_contract(&s.client.address, || {
+        assert!(s
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::BySender(sender.clone())));
+        assert_eq!(
+            s.env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::BySenderMigrationCursor(sender.clone())),
+            Some(100)
+        );
+    });
+
+    let page = s.client.streams_by_sender(&sender, &95, &10);
+    assert_eq!(page.len(), 10);
+    assert_eq!(page.get(0).unwrap(), 95);
+    assert_eq!(page.get(9).unwrap(), 104);
+
+    assert_eq!(s.client.migrate_sender_index(&sender, &10), 250);
+    s.env.as_contract(&s.client.address, || {
+        assert!(!s
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::BySender(sender.clone())));
+    });
+}
+
+#[test]
+fn append_during_partial_sender_migration_preserves_order() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+
+    s.env.as_contract(&s.client.address, || {
+        let mut legacy = soroban_sdk::Vec::new(&s.env);
+        for id in 0..150_u64 {
+            legacy.push_back(id);
+        }
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BySender(sender.clone()), &legacy);
+
+        crate::index::append_sender_index(&s.env, &sender, 999);
+    });
+
+    assert_eq!(s.client.stream_count_by_sender(&sender), 151);
+
+    let tail = s.client.streams_by_sender(&sender, &145, &10);
+    assert_eq!(tail.len(), 6);
+    assert_eq!(tail.get(0).unwrap(), 145);
+    assert_eq!(tail.get(4).unwrap(), 149);
+    assert_eq!(tail.get(5).unwrap(), 999);
+
+    assert_eq!(s.client.migrate_sender_index(&sender, &10), 151);
+    let tail_after = s.client.streams_by_sender(&sender, &145, &10);
+    assert_eq!(tail_after, tail);
+}
+
 // ── Issue #204: cancel_batch_streams ─────────────────────────────────────────
 
 #[test]
@@ -410,6 +492,41 @@ fn seed_sender_pages(env: &Env, factory: &Address, count: u32) -> Address {
 }
 
 #[test]
+fn streams_by_sender_reports_total_so_a_capped_limit_is_not_silent() {
+    let (env, client, contract_id) = index_ttl_env();
+    let sender = seed_sender_pages(&env, &contract_id, 250);
+
+    // Asking for far more than MAX_PAGE_SIZE is silently capped, but `total`
+    // lets the caller tell "capped" apart from "sender only has 200 streams"
+    // without a separate stream_count_by_sender call.
+    let page = client.streams_by_sender(&sender, &0, &200);
+    assert_eq!(page.ids.len(), 100);
+    assert_eq!(page.total, 250);
+    assert!((page.ids.len() as u32) < page.total);
+
+    // A sender whose whole history fits in one page reports total == ids.len(),
+    // so the same comparison correctly signals "no more pages".
+    use crate::storage::DataKey;
+    use soroban_sdk::Vec as SVec;
+    let small_sender = Address::generate(&env);
+    env.as_contract(&contract_id, || {
+        let mut v = SVec::new(&env);
+        for i in 0..50u64 {
+            v.push_back(i);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::BySenderPage(small_sender.clone(), 0), &v);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BySenderCount(small_sender.clone()), &50u32);
+    });
+    let small_page = client.streams_by_sender(&small_sender, &0, &200);
+    assert_eq!(small_page.ids.len(), 50);
+    assert_eq!(small_page.total, 50);
+}
+
+#[test]
 fn streams_by_sender_refreshes_ttl_on_all_pages_not_just_read_page() {
     use crate::storage::DataKey;
     use crate::ttl;
@@ -420,7 +537,7 @@ fn streams_by_sender_refreshes_ttl_on_all_pages_not_just_read_page() {
 
     // Read only the newest page — the "most recent first" UI pattern that used
     // to leave the older pages untoccuched and, eventually, archived.
-    let last_page = client.streams_by_sender(&sender, &200, &100);
+    let last_page = client.streams_by_sender(&sender, &200, &100).ids;
     assert_eq!(last_page.len(), 50);
     assert_eq!(last_page.get(0), Some(200));
     assert_eq!(last_page.get(49), Some(249));
@@ -441,7 +558,7 @@ fn streams_by_sender_refreshes_ttl_on_all_pages_not_just_read_page() {
     }
 
     // And the whole history is still readable from the start.
-    let head = client.streams_by_sender(&sender, &0, &100);
+    let head = client.streams_by_sender(&sender, &0, &100).ids;
     assert_eq!(head.len(), 100);
     assert_eq!(head.get(0), Some(0));
 }

@@ -1,5 +1,6 @@
 #![no_std]
 
+use drip_common::rbac;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
 
 /// TTL extension constants matching the convention used across sibling
@@ -32,7 +33,8 @@ fn bump_instance(env: &Env) {
 /// oracle configuration, and emergency pause authority:
 ///
 /// - `Admin`       — configure oracle, grant/revoke roles, emergency pause.
-/// - `PriceFeeder` — submit prices (or Admin, acting as super-user).
+/// - `PriceFeeder` — submit prices. `submit_price` requires this role
+///                   specifically; being `Admin` alone is not sufficient.
 /// - `Pauser`      — call `pause`/`unpause` without needing full `Admin`.
 ///                   Mirrors `DripGovernor::Role::Pauser`, closing the
 ///                   delegation gap noted in issue #203.
@@ -57,6 +59,7 @@ pub struct RoleKey {
 }
 
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     Config,
@@ -362,7 +365,11 @@ impl TwapOracle {
         Ok(())
     }
 
-    /// Submit a price observation. Gated on `PriceFeeder` (or `Admin`).
+    /// Submit a price observation. Gated strictly on `PriceFeeder` — `Admin`
+    /// is not sufficient, so a single admin key cannot inject a price point
+    /// into the feeder set and shift the aggregated median. The admin can
+    /// grant itself `PriceFeeder`, but that is an explicit, auditable on-chain
+    /// action rather than an implicit super-user bypass.
     ///
     /// `price` is a fixed-point integer scaled by `10^decimals`, where
     /// `decimals` comes from the oracle's stored `OracleConfig` (set via
@@ -391,7 +398,7 @@ impl TwapOracle {
         if is_paused(&env) {
             return Err(Error::ContractPaused);
         }
-        require_role_or_admin(&env, &caller, Role::PriceFeeder)?;
+        require_role(&env, &caller, Role::PriceFeeder)?;
 
         if price == 0 {
             return Err(Error::InvalidPrice);
@@ -609,101 +616,94 @@ impl TwapOracle {
     }
 }
 
-// ── Internal helpers ───────────────────────────────────────────────────────
+// ── Internal RBAC helpers (delegate to drip_common::rbac) ─────────────────
+//
+// These thin wrappers translate the oracle's DataKey / Role types into the
+// generic key values expected by drip_common::rbac, keeping every RBAC logic
+// change in one place (the shared crate) rather than duplicated here.
 
-fn has_role(env: &Env, role: Role, account: &Address) -> bool {
-    let key = DataKey::Role(RoleKey {
+fn role_key(role: Role, account: &Address) -> DataKey {
+    DataKey::Role(RoleKey {
         role,
         account: account.clone(),
-    });
-    env.storage().instance().has(&key)
+    })
 }
 
-/// Returns every account currently holding `role` from the persistent index.
+fn has_role(env: &Env, role: Role, account: &Address) -> bool {
+    rbac::has_role(env, &role_key(role, account))
+}
+
+/// Returns every account currently holding `role` from the instance-storage index.
 fn role_members(env: &Env, role: Role) -> Vec<Address> {
-    env.storage()
-        .instance()
-        .get(&DataKey::RoleMembers(role))
-        .unwrap_or(Vec::new(env))
+    rbac::role_members(env, &DataKey::RoleMembers(role))
 }
 
 fn grant_role_inner(env: &Env, role: Role, account: &Address) -> bool {
-    if has_role(env, role, account) {
-        return false;
-    }
-    let key = DataKey::Role(RoleKey {
-        role,
-        account: account.clone(),
-    });
-    env.storage().instance().set(&key, &true);
-    if role == Role::Admin {
-        let next: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminCount)
-            .unwrap_or(0)
-            + 1;
-        env.storage().instance().set(&DataKey::AdminCount, &next);
-    }
-    // Maintain the role-members index.
-    let mut members: Vec<Address> = role_members(env, role);
-    members.push_back(account.clone());
-    env.storage()
-        .instance()
-        .set(&DataKey::RoleMembers(role), &members);
-    true
+    rbac::grant(
+        env,
+        &role_key(role, account),
+        &DataKey::AdminCount,
+        &DataKey::RoleMembers(role),
+        role == Role::Admin,
+        account,
+    )
 }
 
+/// Revokes `role` from `account`.
+///
+/// When the role is `PriceFeeder`, also purges the feeder's submission data
+/// via `remove_submitter` — an oracle-specific side-effect kept here rather
+/// than in the shared crate.
 fn revoke_role_inner(env: &Env, role: Role, account: &Address) -> Result<bool, Error> {
-    if !has_role(env, role, account) {
-        return Ok(false);
-    }
-    if role == Role::Admin {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminCount)
-            .unwrap_or(0);
-        if count <= 1 {
-            return Err(Error::LastAdmin);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminCount, &(count - 1));
-    }
-    let key = DataKey::Role(RoleKey {
-        role,
-        account: account.clone(),
-    });
-    env.storage().instance().remove(&key);
-    // Remove from the role-members index.
-    let members: Vec<Address> = role_members(env, role);
-    let mut updated: Vec<Address> = Vec::new(env);
-    for m in members.iter() {
-        if m != *account {
-            updated.push_back(m);
-        }
-    }
-    env.storage()
-        .instance()
-        .set(&DataKey::RoleMembers(role), &updated);
+    let removed = rbac::revoke(
+        env,
+        &role_key(role, account),
+        &DataKey::AdminCount,
+        &DataKey::RoleMembers(role),
+        role == Role::Admin,
+        account,
+    )
+    .map_err(|e| match e {
+        rbac::RbacError::LastAdmin => Error::LastAdmin,
+        rbac::RbacError::NotAuthorized => Error::NotAuthorized,
+    })?;
 
-    if role == Role::PriceFeeder {
+    // Oracle-specific: clean up submission data when a PriceFeeder is revoked.
+    if removed && role == Role::PriceFeeder {
         remove_submitter(env, account);
     }
 
-    Ok(true)
+    Ok(removed)
 }
 
-/// Requires that `caller` authorized the transaction and holds `role` **or**
-/// is an `Admin`. Admin acts as a super-user.
-fn require_role_or_admin(env: &Env, caller: &Address, role: Role) -> Result<(), Error> {
+/// Requires that `caller` authorized the transaction and holds `role`
+/// specifically. Unlike [`require_role_or_admin`], being `Admin` is **not**
+/// sufficient — the role grant itself is checked. `submit_price` uses this
+/// so the admin key alone cannot inject a price point into the feeder set
+/// and pull the aggregated median (see
+/// [`TwapOracle::submit_price`](crate::TwapOracle::submit_price)).
+fn require_role(env: &Env, caller: &Address, role: Role) -> Result<(), Error> {
     caller.require_auth();
-    if has_role(env, Role::Admin, caller) || has_role(env, role, caller) {
+    if has_role(env, role, caller) {
         Ok(())
     } else {
         Err(Error::NotAuthorized)
     }
+}
+
+/// Requires that `caller` authorized the transaction and holds `role` **or**
+/// is an `Admin`. Admin acts as a super-user.
+///
+/// Does NOT bump TTL here — callers call `bump_instance` at their entry point.
+fn require_role_or_admin(env: &Env, caller: &Address, role: Role) -> Result<(), Error> {
+    rbac::require_role_or_admin(
+        env,
+        caller,
+        &role_key(role, caller),
+        &role_key(Role::Admin, caller),
+        None, // oracle bumps TTL at the entry-point level, not inside the RBAC check
+    )
+    .map_err(|_| Error::NotAuthorized)
 }
 
 /// Records `account` in the `Submitters` set the first time it submits a
@@ -1006,6 +1006,13 @@ mod tests {
         (env, client, admin)
     }
 
+    /// Grants `admin` the `PriceFeeder` role. `submit_price` requires the
+    /// role specifically (Admin alone is rejected), so tests that submit
+    /// prices as the admin must grant the role first.
+    fn grant_admin_feeder(client: &TwapOracleClient<'static>, admin: &Address) {
+        client.grant_role(admin, &Role::PriceFeeder, admin);
+    }
+
     #[test]
     fn initialize_sets_admin_and_grants_role() {
         let (_env, client, admin) = setup();
@@ -1086,10 +1093,15 @@ mod tests {
     }
 
     #[test]
-    fn admin_can_submit_price() {
+    fn admin_without_price_feeder_role_cannot_submit_price() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
 
+        // Admin alone is not a price feeder — must hold PriceFeeder explicitly.
+        let result = client.try_submit_price(&admin, &100);
+        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+
+        client.grant_role(&admin, &Role::PriceFeeder, &admin);
         let result = client.try_submit_price(&admin, &100);
         assert!(result.is_ok());
     }
@@ -1110,6 +1122,7 @@ mod tests {
     fn submit_price_rejects_zero() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let result = client.try_submit_price(&admin, &0);
         assert_eq!(result, Err(Ok(Error::InvalidPrice)));
@@ -1142,6 +1155,7 @@ mod tests {
     fn get_twap_price_rejects_stale_price() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1171,6 +1185,7 @@ mod tests {
     fn get_twap_price_returns_fresh_price() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1189,6 +1204,7 @@ mod tests {
     fn calculate_fiat_stream_payout_works() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1207,6 +1223,7 @@ mod tests {
     fn calculate_fiat_stream_payout_overflow() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 0,
@@ -1225,6 +1242,7 @@ mod tests {
     fn calculate_fiat_stream_payout_deadlocks_when_outer_lock_held() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1311,6 +1329,7 @@ mod tests {
     fn pause_blocks_submit_price() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1329,6 +1348,7 @@ mod tests {
     fn submit_price_works_after_unpause() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         client.pause(&admin);
         client.unpause(&admin);
@@ -1360,6 +1380,7 @@ mod tests {
     fn get_twap_price_works_while_paused() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1588,6 +1609,7 @@ mod tests {
     fn get_twap_price_aggregates_median_across_feeders() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1613,6 +1635,7 @@ mod tests {
     fn get_twap_price_averages_middle_two_on_even_count() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1635,6 +1658,7 @@ mod tests {
     fn get_twap_price_ignores_stale_submitters_in_aggregate() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1670,6 +1694,7 @@ mod tests {
     fn get_twap_price_errors_stale_when_all_submitters_stale() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1702,6 +1727,7 @@ mod tests {
     fn price_age_reports_seconds_since_last_submission() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1755,6 +1781,7 @@ mod tests {
     fn is_price_stale_reflects_max_staleness_without_erroring() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -1965,6 +1992,7 @@ mod tests {
     fn submit_price_extends_instance_ttl() {
         let (env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
         client.submit_price(&admin, &50_000_000);
 
         let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
@@ -1977,6 +2005,7 @@ mod tests {
     fn configure_oracle_clears_price_when_decimals_change() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -2004,6 +2033,7 @@ mod tests {
     fn configure_oracle_clears_price_when_asset_peg_changes() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,
@@ -2031,6 +2061,7 @@ mod tests {
     fn configure_oracle_preserves_price_when_only_staleness_changes() {
         let (_env, client, admin) = setup();
         client.initialize(&admin);
+        grant_admin_feeder(&client, &admin);
 
         let config = OracleConfig {
             decimals: 8,

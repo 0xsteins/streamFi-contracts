@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, Vec};
 
 /// Identifies which on-chain stream operation to estimate fees for.
 ///
@@ -80,6 +80,24 @@ pub struct FactoryStatus {
     /// Optional rather than making the whole call fallible so that a governor
     /// outage does not also hide `is_paused`, which this view exists to report.
     pub protocol_fee_bps: Option<u32>,
+}
+
+/// A page of stream IDs returned by `streams_by_sender` / `streams_by_recipient`,
+/// paired with the total count so a caller can tell truncation from an
+/// exhausted history without a separate `stream_count_by_*` round-trip.
+///
+/// `ids.len()` is capped at [`crate::query::MAX_PAGE_SIZE`] (100) regardless of
+/// the requested `limit`. Compare `offset + ids.len()` against `total`: if it
+/// is less, more pages remain (whether because `limit` was clamped or the
+/// caller simply asked for a partial window).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamPage {
+    pub ids: Vec<u64>,
+    /// Total number of streams for this sender/recipient, independent of
+    /// `offset`/`limit`. Equivalent to `stream_count_by_sender` /
+    /// `stream_count_by_recipient`.
+    pub total: u32,
 }
 
 /// Storage keys for the DripFactory contract.
@@ -178,6 +196,22 @@ pub enum DataKey {
     /// Key: `DataKey::ByRecipientPage(Address, u32)` — recipient plus zero-based page number
     /// Value: `Vec<u64>` — up to `query::MAX_PAGE_SIZE` stream IDs in creation order
     ByRecipientPage(Address, u32),
+
+    /// **Persistent storage.** Number of legacy sender entries already copied
+    /// into paged storage during an incremental migration.
+    BySenderMigrationCursor(Address),
+
+    /// **Persistent storage.** Original sender legacy-index length captured
+    /// when incremental migration starts.
+    BySenderLegacyCount(Address),
+
+    /// **Persistent storage.** Number of legacy recipient entries already copied
+    /// into paged storage during an incremental migration.
+    ByRecipientMigrationCursor(Address),
+
+    /// **Persistent storage.** Original recipient legacy-index length captured
+    /// when incremental migration starts.
+    ByRecipientLegacyCount(Address),
 
     /// **Persistent storage.** Total number of sender-indexed streams.
     /// Key: `DataKey::BySenderCount(Address)` — sender address
