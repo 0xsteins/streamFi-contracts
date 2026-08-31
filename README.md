@@ -38,7 +38,7 @@ fn cancel(env: Env, caller: Address) -> Result<(), Error>
 fn pause(env: Env, caller: Address) -> Result<(), Error>
 fn resume(env: Env, caller: Address) -> Result<(), Error>
 fn top_up(env: Env, caller: Address, amount: i128) -> Result<(), Error>
-fn clawback(env: Env, caller: Address) -> Result<i128, Error>
+fn clawback(env: Env, caller: Address) -> Result<i128, Error> // rejected while paused; resume() first
 
 // Extend end_time by extra_time_seconds, pulling the exact rate-implied deposit from the sender
 fn extend_duration(env: Env, caller: Address, extra_time_seconds: u64) -> Result<(), Error>
