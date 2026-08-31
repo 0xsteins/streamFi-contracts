@@ -68,7 +68,9 @@ pub fn get_balance(env: &Env) -> Option<i128> {
 
 #[allow(dead_code)]
 pub fn remove_operator_withdraw_limit(env: &Env) {
-    env.storage().instance().remove(&DataKey::OperatorWithdrawLimit);
+    env.storage()
+        .instance()
+        .remove(&DataKey::OperatorWithdrawLimit);
 }
 
 pub fn set_operator(env: &Env, op: &Address) {
@@ -84,11 +86,15 @@ pub fn remove_operator(env: &Env) {
 }
 
 pub fn set_operator_withdraw_limit(env: &Env, v: &i128) {
-    env.storage().instance().set(&DataKey::OperatorWithdrawLimit, v);
+    env.storage()
+        .instance()
+        .set(&DataKey::OperatorWithdrawLimit, v);
 }
 
 pub fn get_operator_withdraw_limit(env: &Env) -> Option<i128> {
-    env.storage().instance().get(&DataKey::OperatorWithdrawLimit)
+    env.storage()
+        .instance()
+        .get(&DataKey::OperatorWithdrawLimit)
 }
 
 pub fn set_paused(env: &Env, paused: bool) {

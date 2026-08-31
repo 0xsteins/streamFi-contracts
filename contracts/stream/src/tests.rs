@@ -1320,15 +1320,15 @@ fn set_operator_replaces_existing_operator_atomically() {
     let s = Setup::new(100, 3600, false);
     let op1 = Address::generate(&s.env);
     let op2 = Address::generate(&s.env);
-    
+
     // Set initial operator
     s.client.set_operator(&s.sender, &op1);
     assert_eq!(s.client.operator(), Some(op1.clone()));
-    
+
     // Replace with a different operator - should succeed now
     s.client.set_operator(&s.sender, &op2);
     assert_eq!(s.client.operator(), Some(op2.clone()));
-    
+
     // Verify we can replace again
     let op3 = Address::generate(&s.env);
     s.client.set_operator(&s.sender, &op3);
@@ -1341,10 +1341,10 @@ fn set_operator_is_idempotent_for_same_address() {
     // The early return keeps this operation idempotent.
     let s = Setup::new(100, 3600, false);
     let operator = Address::generate(&s.env);
-    
+
     s.client.set_operator(&s.sender, &operator);
     assert_eq!(s.client.operator(), Some(operator.clone()));
-    
+
     // Setting the same operator again should succeed without error
     s.client.set_operator(&s.sender, &operator);
     assert_eq!(s.client.operator(), Some(operator));
@@ -1757,7 +1757,10 @@ fn event_sequence_is_persisted_in_config_and_not_left_as_legacy_state() {
         )
     });
 
-    assert!(has_config, "Config must be present after event-driven updates");
+    assert!(
+        has_config,
+        "Config must be present after event-driven updates"
+    );
     assert!(
         !has_event_sequence,
         "EventSequence must be stored in Config rather than as a standalone legacy key"
@@ -1766,7 +1769,10 @@ fn event_sequence_is_persisted_in_config_and_not_left_as_legacy_state() {
     let info = s
         .env
         .as_contract(&s.client.address, || crate::state::load(&s.env));
-    assert_eq!(info.event_sequence, 3, "pause/resume emits two events after init");
+    assert_eq!(
+        info.event_sequence, 3,
+        "pause/resume emits two events after init"
+    );
     assert_eq!(s.client.event_sequence(), 3);
 }
 

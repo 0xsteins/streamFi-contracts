@@ -74,7 +74,7 @@ mod factory_batch_cancel {
         //
         // With the dedup fix, duplicate addresses should be silently deduplicated,
         // so only one cancel is attempted per unique address.
-        
+
         let env = base_env();
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -113,7 +113,7 @@ mod factory_batch_cancel {
         }
 
         // Verify the stream is cancelled
-        assert_eq!(stream_client.info().is_cancelled(), true);
+        assert!(stream_client.info().is_cancelled());
     }
 
     #[test]
@@ -121,7 +121,7 @@ mod factory_batch_cancel {
         // Verify that calling cancel twice on the same stream returns
         // StreamCancelled error on the second attempt (not a panic).
         // This is the underlying behavior that could cause a batch to fail.
-        
+
         let env = base_env();
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -131,10 +131,13 @@ mod factory_batch_cancel {
 
         // First cancel should succeed
         client.cancel(&sender);
-        assert_eq!(client.info().is_cancelled(), true);
+        assert!(client.info().is_cancelled());
 
         // Second cancel should return an error (StreamCancelled), not panic
         let result = client.try_cancel(&sender);
-        assert!(result.is_err(), "Second cancel should fail with StreamCancelled");
+        assert!(
+            result.is_err(),
+            "Second cancel should fail with StreamCancelled"
+        );
     }
 }

@@ -430,7 +430,11 @@ impl TwapOracle {
         // oracle has not been configured yet there is no ceiling to enforce
         // (identical to `max_price == 0`), so submission is not blocked — see
         // issue #226.
-        if let Some(config) = env.storage().instance().get::<_, OracleConfig>(&DataKey::Config) {
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<_, OracleConfig>(&DataKey::Config)
+        {
             if config.max_price != 0 && price > config.max_price {
                 return Err(Error::PriceExceedsMaxPrice);
             }
@@ -578,7 +582,9 @@ impl TwapOracle {
     /// re-entering `get_twap_price` itself. This keeps the aggregation logic in
     /// one place while preserving the guard.
     pub fn calculate_fiat_stream_payout(env: Env, token_amount: u64) -> Result<u64, Error> {
-        with_guard(&env, || Self::calculate_fiat_stream_payout_inner(env.clone(), token_amount))
+        with_guard(&env, || {
+            Self::calculate_fiat_stream_payout_inner(env.clone(), token_amount)
+        })
     }
 
     fn calculate_fiat_stream_payout_inner(env: Env, token_amount: u64) -> Result<u64, Error> {
@@ -1209,10 +1215,7 @@ mod tests {
 
         // Exactly at the ceiling is allowed.
         client.submit_price(&admin, &1_000_000_000_000_000_000);
-        assert_eq!(
-            client.get_twap_price(),
-            1_000_000_000_000_000_000
-        );
+        assert_eq!(client.get_twap_price(), 1_000_000_000_000_000_000);
 
         // Below the ceiling is allowed.
         client.submit_price(&admin, &500_000_000);
