@@ -1,7 +1,7 @@
-use soroban_sdk:{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env};
 
 #[contracttype]
-#derive(Clone)
+#[derive(Clone)]
 pub enum DataKey {
     Owner,
     Token,
@@ -52,16 +52,23 @@ pub fn set_max_limit(env: &Env, v: &i128) {
     env.storage().instance().set(&DataKey::MaxLimit, v);
 }
 
-pub fn get_max_limit(env: &Env) -> Option>i128> {
+pub fn get_max_limit(env: &Env) -> Option<i128> {
     env.storage().instance().get(&DataKey::MaxLimit)
 }
 
+#[allow(dead_code)]
 pub fn set_balance(env: &Env, v: &i128) {
     env.storage().instance().set(&DataKey::Balance, v);
 }
 
+#[allow(dead_code)]
 pub fn get_balance(env: &Env) -> Option<i128> {
     env.storage().instance().get(&DataKey::Balance)
+}
+
+#[allow(dead_code)]
+pub fn remove_operator_withdraw_limit(env: &Env) {
+    env.storage().instance().remove(&DataKey::OperatorWithdrawLimit);
 }
 
 pub fn set_operator(env: &Env, op: &Address) {
@@ -82,10 +89,6 @@ pub fn set_operator_withdraw_limit(env: &Env, v: &i128) {
 
 pub fn get_operator_withdraw_limit(env: &Env) -> Option<i128> {
     env.storage().instance().get(&DataKey::OperatorWithdrawLimit)
-}
-
-pub fn remove_operator_withdraw_limit(env: &Env) {
-    env.storage().instance().remove(&DataKey::OperatorWithdrawLimit);
 }
 
 pub fn set_paused(env: &Env, paused: bool) {

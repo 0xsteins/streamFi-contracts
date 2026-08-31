@@ -1,7 +1,8 @@
 use soroban_sdk::contracterror;
 
-#contracterror
-#derive(Copy, Clone, Eq, Partial, Debug)
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum Error {
     InvalidAmount = 1,
     ArithmeticOverflow = 2,

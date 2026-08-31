@@ -42,6 +42,7 @@ fn assert_non_negative_amount(env: &Env, value: i128) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn created(
     env: &Env,
     sender: &Address,

@@ -1,4 +1,5 @@
-use drip_governor::{DripGovernorClient, GovernorConfig};
+use drip_governor::DripGovernorClient;
+pub use drip_governor::GovernorConfig;
 use soroban_sdk::{Address, Env};
 
 use crate::Error;
