@@ -284,6 +284,151 @@ fn clawback_disabled_panics() {
     assert_eq!(result, Err(Ok(Error::ClawbackDisabled)));
 }
 
+/// Regression test for #458.
+///
+/// Open-ended streams (`end_time == 0`) accrue indefinitely while their
+/// funded balance is finite. `clawback` must refund exactly the unstreamed
+/// remainder (balance − accrued-but-unwithdrawn) and must never touch the
+/// portion that has already accrued to the recipient.
+#[test]
+fn clawback_open_ended_refunds_unstreamed_remainder() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let tok = token::Client::new(&env, &token_addr);
+    let tok_admin = token::StellarAssetClient::new(&env, &token_addr);
+
+    // rate = 100 stroops/s; deposit = 10_000 stroops → funds 100 s of streaming.
+    let rate: i128 = 100;
+    let deposit: i128 = 10_000;
+    let now: u64 = 1_000_000;
+
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 21,
+        sequence_number: 1,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl: 6_312_000,
+    });
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    tok_admin.mint(&sender, &deposit);
+    tok.transfer(&sender, &stream_id, &deposit);
+
+    client.initialize(
+        &sender,
+        &recipient,
+        &token_addr,
+        &rate,
+        &now,
+        &0, // open-ended — no end_time
+        &true,
+    );
+
+    // Advance 30 s → 3_000 stroops have accrued to the recipient.
+    env.ledger().set(LedgerInfo {
+        timestamp: now + 30,
+        ..env.ledger().get()
+    });
+
+    let accrued: i128 = rate * 30; // 3_000
+    let expected_refund = deposit - accrued; // 7_000
+
+    let sender_before = tok.balance(&sender);
+    let reclaimed = client.clawback(&sender);
+
+    // Clawback returns exactly the unstreamed remainder.
+    assert_eq!(reclaimed, expected_refund);
+    // Sender's wallet grew by the same amount.
+    assert_eq!(tok.balance(&sender) - sender_before, expected_refund);
+    // Accrued balance is still in the contract, available to the recipient.
+    assert_eq!(tok.balance(&stream_id), accrued);
+}
+
+/// Regression test for #458 — second invariant.
+///
+/// After a clawback on an open-ended stream the recipient can still
+/// withdraw every stroop that had already accrued before the clawback,
+/// but cannot withdraw more.
+#[test]
+fn clawback_open_ended_does_not_touch_accrued_funds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let tok = token::Client::new(&env, &token_addr);
+    let tok_admin = token::StellarAssetClient::new(&env, &token_addr);
+
+    let rate: i128 = 100;
+    let deposit: i128 = 10_000;
+    let now: u64 = 1_000_000;
+
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 21,
+        sequence_number: 1,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl: 6_312_000,
+    });
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    tok_admin.mint(&sender, &deposit);
+    tok.transfer(&sender, &stream_id, &deposit);
+
+    client.initialize(
+        &sender,
+        &recipient,
+        &token_addr,
+        &rate,
+        &now,
+        &0, // open-ended
+        &true,
+    );
+
+    // Advance 50 s → 5_000 stroops accrued.
+    env.ledger().set(LedgerInfo {
+        timestamp: now + 50,
+        ..env.ledger().get()
+    });
+
+    let accrued: i128 = rate * 50; // 5_000
+
+    // Sender claws back the unstreamed half.
+    client.clawback(&sender);
+
+    // Time is frozen; withdrawable must equal the full accrued amount.
+    assert_eq!(client.withdrawable(), accrued);
+
+    // Recipient can withdraw every accrued stroop.
+    let withdrawn = client.withdraw(&accrued);
+    assert_eq!(withdrawn, accrued);
+    assert_eq!(tok.balance(&recipient), accrued);
+
+    // Nothing left to withdraw.
+    assert_eq!(client.withdrawable(), 0);
+}
+
 // ── Top-up ────────────────────────────────────────────────────────────────────
 
 #[test]
