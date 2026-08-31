@@ -323,6 +323,14 @@ impl TokenVault {
         Ok(())
     }
 
+    /// Permissionless keep-alive: extend the vault instance TTL so a paused
+    /// vault can be kept warm during long investigations without requiring
+    /// the owner to re-open the contract or submit a `RestoreFootprint`.
+    pub fn keep_alive(env: Env) -> Result<(), Error> {
+        bump_instance(&env);
+        Ok(())
+    }
+
     /// Read-only: whether the vault is currently under an emergency pause.
     pub fn is_paused(env: Env) -> bool {
         is_paused(&env)
