@@ -1553,6 +1553,34 @@ fn initialize_writes_only_config_and_not_legacy_keys() {
 }
 
 #[test]
+fn event_sequence_is_persisted_in_config_and_not_left_as_legacy_state() {
+    let s = Setup::new(100, 3600, false);
+    s.advance_secs(100);
+    s.client.pause(&s.sender);
+    s.client.resume(&s.sender);
+
+    let (has_config, has_event_sequence) = s.env.as_contract(&s.client.address, || {
+        let storage = s.env.storage().instance();
+        (
+            storage.has(&DataKey::Config),
+            storage.has(&DataKey::EventSequence),
+        )
+    });
+
+    assert!(has_config, "Config must be present after event-driven updates");
+    assert!(
+        !has_event_sequence,
+        "EventSequence must be stored in Config rather than as a standalone legacy key"
+    );
+
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+    assert_eq!(info.event_sequence, 3, "pause/resume emits two events after init");
+    assert_eq!(s.client.event_sequence(), 3);
+}
+
+#[test]
 fn state_mutation_writes_only_config_not_legacy_keys() {
     let s = Setup::new(100, 3600, false);
     s.advance_secs(100);
@@ -1624,6 +1652,7 @@ fn save_migrates_legacy_keys_to_config_once() {
                 withdrawn: 0,
                 paused_at: 0,
                 flags: 0,
+                event_sequence: 0,
             },
         );
     });

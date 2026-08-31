@@ -122,8 +122,27 @@ impl DripStream {
         }
 
         let s = env.storage().instance();
-        s.set(&DataKey::EventSequence, &0_u64);
         s.set(&DataKey::StorageVersion, &storage::CURRENT_STORAGE_VERSION);
+
+        // Write the initial state before emitting the creation event so the
+        // event sequence lives with the consolidated `Config` payload from the
+        // start. `events::created()` then advances it to sequence 1 and persists
+        // the updated counter back into `Config`.
+        state::save(
+            &env,
+            &StreamInfo {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token: token.clone(),
+                rate_per_second,
+                start_time,
+                end_time,
+                flags,
+                withdrawn: 0,
+                paused_at: 0,
+                event_sequence: 0,
+            },
+        );
 
         events::created(
             &env,
@@ -133,24 +152,6 @@ impl DripStream {
             rate_per_second,
             start_time,
             end_time,
-        );
-
-        // Write the entire stream state as a single struct — one storage
-        // write instead of eleven. All subsequent reads go through
-        // state::load(), which fetches the whole struct in one call.
-        state::save(
-            &env,
-            &StreamInfo {
-                sender,
-                recipient,
-                token,
-                rate_per_second,
-                start_time,
-                end_time,
-                flags,
-                withdrawn: 0,
-                paused_at: 0,
-            },
         );
     }
 
@@ -781,10 +782,11 @@ impl DripStream {
     /// processed after reconnecting. A gap means the missing ledger range
     /// must be replayed before live processing continues.
     pub fn event_sequence(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::EventSequence)
-            .unwrap_or(0)
+        let storage = env.storage().instance();
+        if storage.has(&DataKey::Config) {
+            return state::load(&env).event_sequence;
+        }
+        storage.get(&DataKey::EventSequence).unwrap_or(0)
     }
 
     /// Storage layout version this instance was initialized with.
