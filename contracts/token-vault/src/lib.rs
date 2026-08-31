@@ -10,8 +10,10 @@ use drip_common::{is_zero_address, TTL_EXTEND_TO, TTL_THRESHOLD};
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, token, Address, Env};
 use storage::{
-    get_max_limit, get_operator, get_owner, get_token, is_paused, remove_operator, set_max_limit,
-    set_operator, set_owner, set_paused, set_token,
+    get_max_limit, get_operator, get_operator_withdraw_limit, get_owner, get_pending_owner,
+    get_pending_owner_proposer, get_token, is_paused, remove_operator, remove_pending_owner,
+    remove_pending_owner_proposer, set_max_limit, set_operator, set_operator_withdraw_limit,
+    set_owner, set_paused, set_pending_owner, set_pending_owner_proposer, set_token,
 };
 
 #[contract]
@@ -147,6 +149,13 @@ impl TokenVault {
             return Err(Error::InvalidAmount);
         }
 
+        if caller != owner {
+            let limit = get_operator_withdraw_limit(&env).ok_or(Error::LimitExceeded)?;
+            if amount > limit {
+                return Err(Error::LimitExceeded);
+            }
+        }
+
         let balance = vault_balance(&env)?;
         let expected_balance = balance
             .checked_sub(amount)
@@ -161,6 +170,29 @@ impl TokenVault {
 
         bump_instance(&env);
         events::withdrawn(&env, &caller, &to, amount, new_balance);
+        Ok(())
+    }
+
+    pub fn set_operator_withdraw_limit(
+        env: Env,
+        caller: Address,
+        new_limit: i128,
+    ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        if new_limit <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let old_limit = get_operator_withdraw_limit(&env).unwrap_or(0);
+        bump_instance(&env);
+        set_operator_withdraw_limit(&env, &new_limit);
+        events::operator_withdraw_limit_set(&env, &caller, old_limit, new_limit);
         Ok(())
     }
 
@@ -277,6 +309,12 @@ impl TokenVault {
     /// Read-only: the current operator address, if any.
     pub fn operator(env: Env) -> Option<Address> {
         get_operator(&env)
+    }
+
+    /// Read-only: the maximum single-call withdrawal a delegated operator may
+    /// execute before the owner raises or removes the cap.
+    pub fn operator_withdraw_limit(env: Env) -> Option<i128> {
+        get_operator_withdraw_limit(&env)
     }
 
     /// Read-only: the current owner address, if any.

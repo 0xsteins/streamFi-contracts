@@ -311,6 +311,37 @@ fn operator_can_set_limit() {
 }
 
 #[test]
+fn operator_withdraw_limit_is_enforced() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &500);
+
+    let op = Address::generate(&s.env);
+    s.client.set_operator(&s.owner, &op);
+    s.client.set_operator_withdraw_limit(&s.owner, &100);
+
+    let recipient = Address::generate(&s.env);
+    let result = s.client.try_withdraw(&op, &recipient, &200);
+    assert_eq!(result, Err(Ok(Error::LimitExceeded)));
+
+    s.client.withdraw(&op, &recipient, &100);
+    assert_eq!(s.token.balance(&recipient), 100);
+}
+
+#[test]
+fn owner_withdraw_is_not_limited_by_operator_cap() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &500);
+
+    let op = Address::generate(&s.env);
+    s.client.set_operator(&s.owner, &op);
+    s.client.set_operator_withdraw_limit(&s.owner, &100);
+
+    let recipient = Address::generate(&s.env);
+    s.client.withdraw(&s.owner, &recipient, &500);
+    assert_eq!(s.token.balance(&recipient), 500);
+}
+
+#[test]
 fn stranger_cannot_withdraw_even_with_operator_set() {
     let s = Setup::new(1_000_000);
     s.client.deposit(&s.owner, &500);
