@@ -152,6 +152,7 @@ impl DripStream {
             rate_per_second,
             start_time,
             end_time,
+            storage::CURRENT_STORAGE_VERSION,
         );
     }
 
