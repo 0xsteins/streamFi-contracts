@@ -24,10 +24,11 @@ use storage::DataKey;
 pub use storage::{BatchStreamRequest, FactoryStatus, FeeEstimate, StreamOperation, StreamPage};
 
 /// Maximum number of streams accepted by a single `create_batch_streams`
-/// (and `cancel_batch_streams`/`stream_addresses`) call. Each
-/// `create_stream` in the batch performs a governor cross-contract call,
-/// two `token::transfer`s, a contract deploy + `initialize` invoke, and
-/// three persistent writes with TTL extensions (~2.5M CPU instructions).
+/// (and `cancel_batch_streams`/`stream_addresses`) call. The batch
+/// performs one governor cross-contract config call, and each stream
+/// performs two `token::transfer`s, a contract deploy + `initialize`
+/// invoke, and three persistent writes with TTL extensions (~2.5M CPU
+/// instructions).
 /// A batch of 100 would require ~250M instructions and a footprint far
 /// beyond the per-transaction budget, so the old cap of 100 was never
 /// reachable in practice — it would exhaust the instruction/footprint
@@ -97,13 +98,59 @@ impl DripFactory {
             return Err(Error::ContractPaused);
         }
 
+        // ── Validation ───────────────────────────────────────────────────
+        let now = Self::validate_stream_request(
+            &env,
+            &sender,
+            &recipient,
+            &token,
+            deposit,
+            rate_per_sec,
+            start_time,
+            end_time,
+        )?;
+
+        // ── Governor-controlled bounds ──────────────────────────────────────
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        let config = governance::config(&env, &governor)?;
+
+        Self::create_stream_with_config(
+            env,
+            &config,
+            now,
+            sender,
+            recipient,
+            token,
+            deposit,
+            rate_per_sec,
+            start_time,
+            end_time,
+            clawback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_stream_request(
+        env: &Env,
+        sender: &Address,
+        recipient: &Address,
+        token: &Address,
+        deposit: i128,
+        rate_per_sec: i128,
+        start_time: u64,
+        end_time: u64,
+    ) -> Result<u64, Error> {
         // ── Recipient validation ─────────────────────────────────────────
-        if is_zero_address(&env, &recipient) || recipient == sender {
+        if is_zero_address(env, recipient) || recipient == sender {
             return Err(Error::InvalidRecipient);
         }
 
         // ── Token validation ─────────────────────────────────────────────
-        if is_zero_address(&env, &token) {
+        if is_zero_address(env, token) {
             return Err(Error::InvalidToken);
         }
 
@@ -142,15 +189,25 @@ impl DripFactory {
                 return Err(Error::InsufficientDeposit);
             }
         }
+        Ok(now)
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn create_stream_with_config(
+        env: Env,
+        config: &governance::GovernorConfig,
+        now: u64,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        rate_per_sec: i128,
+        start_time: u64,
+        end_time: u64,
+        clawback: bool,
+    ) -> Result<u64, Error> {
         // ── Governor-controlled bounds ──────────────────────────────────────
-        let governor: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernorAddress)
-            .ok_or(Error::NotInitialized)?;
-        let config = governance::config(&env, &governor)?;
-        governance::enforce_bounds(&config, rate_per_sec, start_time, end_time, now)?;
+        governance::enforce_bounds(config, rate_per_sec, start_time, end_time, now)?;
 
         // ── Reentrancy guard ─────────────────────────────────────────────
         // `token` is caller-supplied and may not be a well-behaved SEP-41
@@ -268,11 +325,9 @@ impl DripFactory {
     /// Create multiple streams in one transaction, all funded and
     /// authorized by the same `sender`.
     ///
-    /// Reuses `create_stream` verbatim for each request, so validation,
-    /// governor-bound enforcement, the deposit transfer, deployment, and
-    /// registry indexing are all identical to the single-stream path --
-    /// including whatever per-stream signals `create_stream` /
-    /// `DripStream::initialize` already produce.
+    /// Uses the same per-stream validation and deployment path as
+    /// `create_stream`; the governor config is fetched once for the whole
+    /// batch and threaded through to each stream creation.
     ///
     /// Atomicity: Soroban transactions are all-or-nothing at the host
     /// level. If any request fails validation, the `?` below propagates
@@ -292,10 +347,36 @@ impl DripFactory {
             return Err(Error::BatchTooLarge);
         }
 
+        // ── Auth / pause ─────────────────────────────────────────────────
+        sender.require_auth();
+        if pause::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
+        // ── Fetch governor config once for the whole batch ───────────────
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        let config = governance::config(&env, &governor)?;
+
         let mut stream_ids = Vec::new(&env);
         for request in requests.iter() {
-            let stream_id = Self::create_stream(
+            let now = Self::validate_stream_request(
+                &env,
+                &sender,
+                &request.recipient,
+                &request.token,
+                request.deposit,
+                request.rate_per_sec,
+                request.start_time,
+                request.end_time,
+            )?;
+            let stream_id = Self::create_stream_with_config(
                 env.clone(),
+                &config,
+                now,
                 sender.clone(),
                 request.recipient,
                 request.token,
