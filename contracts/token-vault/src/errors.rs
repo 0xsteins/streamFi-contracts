@@ -1,7 +1,7 @@
 use soroban_sdk::contracterror;
 
-#[contracterror]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#contracterror
+#derive(Copy, Clone, Eq, Partial, Debug)
 pub enum Error {
     InvalidAmount = 1,
     ArithmeticOverflow = 2,
@@ -24,4 +24,8 @@ pub enum Error {
     NoPendingOwner = 11,
     /// `accept_owner` was called by an address that is not the pending owner.
     NotPendingOwner = 12,
+    /// The token transfer did not move exactly the expected amount for `deposit`.
+    DepositTransferFailed = 13,
+    /// The token transfer did not move exactly the expected amount for `withdraw`.
+    WithdrawTransferFailed = 14,
 }
