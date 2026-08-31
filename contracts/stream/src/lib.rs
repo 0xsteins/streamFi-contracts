@@ -619,16 +619,29 @@ impl DripStream {
     /// Recipient force-cancels a stream that has been paused beyond a threshold.
     ///
     /// Prevents the sender from indefinitely pausing the stream to hold
-    /// unstreamed tokens hostage. The threshold is hardcoded to 30 days
-    /// (2_592_000 seconds) — a governance-configurable version is planned.
-    /// Settles atomically like `cancel()`: earned tokens go to recipient,
-    /// unstreamed refund goes to sender.
+    /// unstreamed tokens hostage. The threshold defaults to 30 days
+    /// (2_592_000 seconds) but is governance-configurable per deployment —
+    /// see `DripGovernor::set_force_cancel_pause_threshold` and
+    /// `DataKey::ForceCancelPauseThresholdSecs`. Settles atomically like
+    /// `cancel()`: earned tokens go to recipient, unstreamed refund goes to
+    /// sender.
     pub fn force_cancel(env: Env) -> Result<(), Error> {
         state::with_guard(&env, Self::_force_cancel)
     }
 
     fn _force_cancel(env: &Env) -> Result<(), Error> {
-        const PAUSE_THRESHOLD_SECS: u64 = 2_592_000; // 30 days
+        // Governance-configurable per deployment (see
+        // `DripGovernor::set_force_cancel_pause_threshold`); set at
+        // `initialize()` from the factory's read of `GovernorConfig`.
+        // Falls back to the historical 30-day default for streams
+        // initialized before this field existed, or deployed directly
+        // without going through the factory.
+        const DEFAULT_PAUSE_THRESHOLD_SECS: u64 = 2_592_000; // 30 days
+        let pause_threshold_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ForceCancelPauseThresholdSecs)
+            .unwrap_or(DEFAULT_PAUSE_THRESHOLD_SECS);
 
         ttl::bump(env);
 
@@ -640,7 +653,7 @@ impl DripStream {
 
         let now = env.ledger().timestamp();
         let paused_secs = now.saturating_sub(info.paused_at);
-        if paused_secs < PAUSE_THRESHOLD_SECS {
+        if paused_secs < pause_threshold_secs {
             return Err(Error::PauseThresholdNotMet);
         }
 
