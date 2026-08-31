@@ -1,7 +1,7 @@
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk:{contracttype, Address, Env};
 
 #[contracttype]
-#[derive(Clone)]
+#derive(Clone)
 pub enum DataKey {
     Owner,
     Token,
@@ -15,7 +15,7 @@ pub enum DataKey {
     /// Absent key means no operator has been delegated.
     Operator,
     /// Emergency-pause flag. When `true`, all state-mutating entry points
-    /// (`deposit`, `withdraw`, `set_limit`) revert before touching state.
+    /// (deposit, withdraw, set_limit) revert before touching state.
     Paused,
     /// Pending owner address for the 2-step owner transfer.
     /// Set by `propose_owner`, consumed by `accept_owner`.
@@ -45,16 +45,14 @@ pub fn set_max_limit(env: &Env, v: &i128) {
     env.storage().instance().set(&DataKey::MaxLimit, v);
 }
 
-pub fn get_max_limit(env: &Env) -> Option<i128> {
+pub fn get_max_limit(env: &Env) -> Option>i128> {
     env.storage().instance().get(&DataKey::MaxLimit)
 }
 
-#[cfg(test)]
 pub fn set_balance(env: &Env, v: &i128) {
     env.storage().instance().set(&DataKey::Balance, v);
 }
 
-#[cfg(test)]
 pub fn get_balance(env: &Env) -> Option<i128> {
     env.storage().instance().get(&DataKey::Balance)
 }
