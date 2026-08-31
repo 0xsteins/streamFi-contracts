@@ -450,44 +450,46 @@ impl TwapOracle {
     /// - `OracleLocked` if called while the re-entrancy guard is already held
     ///   (see the nested-lock warning on `calculate_fiat_stream_payout`).
     pub fn get_twap_price(env: Env) -> Result<u64, Error> {
-        with_guard(&env, || {
-            let config: OracleConfig = env
-                .storage()
-                .instance()
-                .get(&DataKey::Config)
-                .ok_or(Error::OracleNotConfigured)?;
+        with_guard(&env, || Self::get_twap_price_inner(env.clone()))
+    }
 
-            let submitters: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Submitters)
-                .unwrap_or(Vec::new(&env));
+    fn get_twap_price_inner(env: Env) -> Result<u64, Error> {
+        let config: OracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::OracleNotConfigured)?;
 
-            let now = env.ledger().timestamp();
-            let mut fresh_prices: Vec<u64> = Vec::new(&env);
-            let mut saw_any_submission = false;
+        let submitters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Submitters)
+            .unwrap_or(Vec::new(&env));
 
-            for feeder in submitters.iter() {
-                let submission: Option<PriceData> =
-                    env.storage().persistent().get(&DataKey::Submission(feeder));
-                if let Some(data) = submission {
-                    saw_any_submission = true;
-                    let age = now.saturating_sub(data.updated_at);
-                    if age <= config.max_staleness && data.price != 0 {
-                        fresh_prices.push_back(data.price);
-                    }
+        let now = env.ledger().timestamp();
+        let mut fresh_prices: Vec<u64> = Vec::new(&env);
+        let mut saw_any_submission = false;
+
+        for feeder in submitters.iter() {
+            let submission: Option<PriceData> =
+                env.storage().persistent().get(&DataKey::Submission(feeder));
+            if let Some(data) = submission {
+                saw_any_submission = true;
+                let age = now.saturating_sub(data.updated_at);
+                if age <= config.max_staleness && data.price != 0 {
+                    fresh_prices.push_back(data.price);
                 }
             }
+        }
 
-            if fresh_prices.is_empty() {
-                if saw_any_submission {
-                    return Err(Error::OracleStalePrice);
-                }
-                return Err(Error::NoPriceAvailable);
+        if fresh_prices.is_empty() {
+            if saw_any_submission {
+                return Err(Error::OracleStalePrice);
             }
+            return Err(Error::NoPriceAvailable);
+        }
 
-            Ok(median(fresh_prices))
-        })
+        Ok(median(fresh_prices))
     }
 
     /// Full price health, computed from the same per-feeder submission set
@@ -539,15 +541,16 @@ impl TwapOracle {
 
     /// Converts a nominal token amount into its fiat equivalent.
     ///
-    /// **Nested-lock warning:** This method calls `get_twap_price`
-    /// internally, which acquires and releases its own re-entrancy guard.
-    /// If this method is ever wrapped in an outer guard (e.g., via a
-    /// `with_guard` call), the depth counter will already be at 1 and the
-    /// nested `get_twap_price` call will deadlock with `OracleLocked`.
-    /// Do NOT add a guard to this function without first refactoring
-    /// `get_twap_price` to accept an optional pre-acquired lock.
+    /// **Nested-lock warning:** The public entrypoint takes the oracle
+    /// re-entrancy guard, but it calls the unguarded inner helper rather than
+    /// re-entering `get_twap_price` itself. This keeps the aggregation logic in
+    /// one place while preserving the guard.
     pub fn calculate_fiat_stream_payout(env: Env, token_amount: u64) -> Result<u64, Error> {
-        let current_price = Self::get_twap_price(env.clone())?;
+        with_guard(&env, || Self::calculate_fiat_stream_payout_inner(env.clone(), token_amount))
+    }
+
+    fn calculate_fiat_stream_payout_inner(env: Env, token_amount: u64) -> Result<u64, Error> {
+        let current_price = Self::get_twap_price_inner(env.clone())?;
 
         let config: OracleConfig = env
             .storage()
