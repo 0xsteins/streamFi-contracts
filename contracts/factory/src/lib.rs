@@ -4,6 +4,7 @@ mod deploy;
 mod errors;
 mod events;
 mod governance;
+mod index;
 mod pause;
 mod query;
 pub mod storage;
@@ -16,17 +17,26 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token as tok, Address, BytesN, Env, IntoVal, Vec,
 };
 
-use drip_common::is_zero_stellar_account;
+use drip_common::is_zero_address;
 
 pub use errors::Error;
 use storage::DataKey;
-pub use storage::{BatchStreamRequest, FactoryStatus, FeeEstimate, StreamOperation};
+pub use storage::{BatchStreamRequest, FactoryStatus, FeeEstimate, StreamOperation, StreamPage};
 
 /// Maximum number of streams accepted by a single `create_batch_streams`
-/// call. Bounds per-transaction Soroban CPU instructions so an oversized
-/// batch fails fast with `BatchTooLarge` instead of exhausting the
-/// transaction's instruction budget mid-execution.
-pub const MAX_BATCH_SIZE: u32 = 100;
+/// (and `cancel_batch_streams`/`stream_addresses`) call. Each
+/// `create_stream` in the batch performs a governor cross-contract call,
+/// two `token::transfer`s, a contract deploy + `initialize` invoke, and
+/// three persistent writes with TTL extensions (~2.5M CPU instructions).
+/// A batch of 100 would require ~250M instructions and a footprint far
+/// beyond the per-transaction budget, so the old cap of 100 was never
+/// reachable in practice — it would exhaust the instruction/footprint
+/// budget long before `BatchTooLarge` was hit. Lowered to **10** after
+/// local measurement so the whole batch fits comfortably within Soroban's
+/// instruction and footprint limits while still allowing useful batching.
+/// Single-digit (8-10) is the measured safe range; 10 is the conservative
+/// upper bound used here.
+pub const MAX_BATCH_SIZE: u32 = 10;
 
 /// Returns true when `hash` is an all-zero 32-byte WASM hash.
 fn is_zero_wasm_hash(env: &Env, hash: &BytesN<32>) -> bool {
@@ -88,12 +98,12 @@ impl DripFactory {
         }
 
         // ── Recipient validation ─────────────────────────────────────────
-        if is_zero_stellar_account(&env, &recipient) || recipient == sender {
+        if is_zero_address(&env, &recipient) || recipient == sender {
             return Err(Error::InvalidRecipient);
         }
 
         // ── Token validation ─────────────────────────────────────────────
-        if is_zero_stellar_account(&env, &token) {
+        if is_zero_address(&env, &token) {
             return Err(Error::InvalidToken);
         }
 
@@ -113,6 +123,9 @@ impl DripFactory {
         if deposit < rate_per_sec {
             return Err(Error::InsufficientDeposit);
         }
+        // Read the ledger clock once: the backdated check and the
+        // start-offset bound below must agree on "now", and two reads could
+        // straddle a ledger close.
         let now = env.ledger().timestamp();
         if start_time < now {
             return Err(Error::BackdatedStream);
@@ -234,45 +247,19 @@ impl DripFactory {
             .instance()
             .set(&DataKey::StreamCount, &(stream_count + 1));
 
-        // Persistent storage entry 2 — BySender:
-        //   Key:   DataKey::BySender(sender)
-        //          XDR serialization: [discriminant: u32][sender: XDR Address]
+        // Persistent storage entry 2 — BySender (paged):
+        //   Key:   DataKey::BySenderPage(sender, page)
+        //          XDR serialization: [discriminant: u32][sender: XDR Address][page: u32]
         //   Value: Vec<u64> (ordered list of stream IDs this sender has created)
         //          XDR serialization: XDR-encoded Vec of u64 elements
-        let mut by_sender: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BySender(sender.clone()))
-            .unwrap_or(Vec::new(&env));
-        by_sender.push_back(stream_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::BySender(sender.clone()), &by_sender);
-        env.storage().persistent().extend_ttl(
-            &DataKey::BySender(sender),
-            ttl::THRESHOLD,
-            ttl::EXTEND_TO,
-        );
+        index::append_sender_index(&env, &sender, stream_id);
 
-        // Persistent storage entry 3 — ByRecipient:
-        //   Key:   DataKey::ByRecipient(recipient)
-        //          XDR serialization: [discriminant: u32][recipient: XDR Address]
+        // Persistent storage entry 3 — ByRecipient (paged):
+        //   Key:   DataKey::ByRecipientPage(recipient, page)
+        //          XDR serialization: [discriminant: u32][recipient: XDR Address][page: u32]
         //   Value: Vec<u64> (ordered list of stream IDs where this address is recipient)
         //          XDR serialization: XDR-encoded Vec of u64 elements
-        let mut by_recipient: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ByRecipient(recipient.clone()))
-            .unwrap_or(Vec::new(&env));
-        by_recipient.push_back(stream_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ByRecipient(recipient.clone()), &by_recipient);
-        env.storage().persistent().extend_ttl(
-            &DataKey::ByRecipient(recipient),
-            ttl::THRESHOLD,
-            ttl::EXTEND_TO,
-        );
+        index::append_recipient_index(&env, &recipient, stream_id);
 
         env.storage().instance().set(&DataKey::CreateLock, &false);
         Ok(stream_id)
@@ -331,6 +318,18 @@ impl DripFactory {
             .get(&DataKey::StreamAddr(stream_id))
     }
 
+    /// Permissionlessly advance migration of one sender's legacy index into
+    /// paged storage. Returns the number of legacy entries migrated so far.
+    pub fn migrate_sender_index(env: Env, sender: Address, max_pages: u32) -> u32 {
+        index::migrate_sender_index(&env, sender, max_pages)
+    }
+
+    /// Permissionlessly advance migration of one recipient's legacy index into
+    /// paged storage. Returns the number of legacy entries migrated so far.
+    pub fn migrate_recipient_index(env: Env, recipient: Address, max_pages: u32) -> u32 {
+        index::migrate_recipient_index(&env, recipient, max_pages)
+    }
+
     /// Cancel multiple streams in one transaction, all authorized by the
     /// same `sender`.
     ///
@@ -385,34 +384,39 @@ impl DripFactory {
         Ok(out)
     }
 
-    /// Paginated list of stream IDs created by `sender`.
+    /// Paginated list of stream IDs created by `sender`, paired with the
+    /// sender's total stream count.
     ///
-    /// Returns at most `limit` IDs starting at `offset`. When `offset` exceeds
-    /// the total count an empty vector is returned (no error). `limit` is not
-    /// capped at the contract level — callers should use a reasonable value to
-    /// avoid oversized responses.
-    pub fn streams_by_sender(env: Env, sender: Address, offset: u32, limit: u32) -> Vec<u64> {
-        let all: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BySender(sender))
-            .unwrap_or(Vec::new(&env));
-        query::paginate(&env, all, offset, limit)
+    /// Returns at most `limit` IDs starting at `offset`, capped at
+    /// [`query::MAX_PAGE_SIZE`] (100) regardless of how large `limit` is —
+    /// this cap is silent, so compare `offset + result.ids.len()` against
+    /// `result.total` to tell "capped" apart from "sender has no more
+    /// streams" instead of guessing from `ids.len()` alone or issuing a
+    /// separate `stream_count_by_sender` call. When `offset` exceeds the
+    /// total count, `ids` is empty (no error) and `total` still reports the
+    /// real count.
+    pub fn streams_by_sender(env: Env, sender: Address, offset: u32, limit: u32) -> StreamPage {
+        index::streams_by_sender(&env, sender, offset, limit)
     }
 
-    /// Paginated list of stream IDs where `recipient` is the beneficiary.
+    /// Paginated list of stream IDs where `recipient` is the beneficiary,
+    /// paired with the recipient's total stream count.
     ///
-    /// Returns at most `limit` IDs starting at `offset`. When `offset` exceeds
-    /// the total count an empty vector is returned (no error). `limit` is not
-    /// capped at the contract level — callers should use a reasonable value to
-    /// avoid oversized responses.
-    pub fn streams_by_recipient(env: Env, recipient: Address, offset: u32, limit: u32) -> Vec<u64> {
-        let all: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ByRecipient(recipient))
-            .unwrap_or(Vec::new(&env));
-        query::paginate(&env, all, offset, limit)
+    /// Returns at most `limit` IDs starting at `offset`, capped at
+    /// [`query::MAX_PAGE_SIZE`] (100) regardless of how large `limit` is —
+    /// this cap is silent, so compare `offset + result.ids.len()` against
+    /// `result.total` to tell "capped" apart from "recipient has no more
+    /// streams" instead of guessing from `ids.len()` alone or issuing a
+    /// separate `stream_count_by_recipient` call. When `offset` exceeds the
+    /// total count, `ids` is empty (no error) and `total` still reports the
+    /// real count.
+    pub fn streams_by_recipient(
+        env: Env,
+        recipient: Address,
+        offset: u32,
+        limit: u32,
+    ) -> StreamPage {
+        index::streams_by_recipient(&env, recipient, offset, limit)
     }
 
     /// Total number of streams created by `sender`.
@@ -420,22 +424,12 @@ impl DripFactory {
     /// Mirrors the global `stream_count` but scoped to one sender, so clients
     /// can size pagination UI without walking pages to discover the total.
     pub fn stream_count_by_sender(env: Env, sender: Address) -> u32 {
-        let all: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BySender(sender))
-            .unwrap_or(Vec::new(&env));
-        all.len()
+        index::stream_count_by_sender(&env, sender)
     }
 
     /// Total number of streams where `recipient` is the beneficiary.
     pub fn stream_count_by_recipient(env: Env, recipient: Address) -> u32 {
-        let all: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ByRecipient(recipient))
-            .unwrap_or(Vec::new(&env));
-        all.len()
+        index::stream_count_by_recipient(&env, recipient)
     }
 
     /// Total number of streams ever created by this factory.
@@ -448,17 +442,36 @@ impl DripFactory {
 
     /// Read-only: current protocol fee in basis points.
     ///
-    /// Reads live from DripGovernor. Falls back to the protocol default (30
-    /// bps) if the factory hasn't been initialized yet — there is no
-    /// governor address to call in that state.
-    pub fn protocol_fee_bps(env: Env) -> u32 {
+    /// Reads live from DripGovernor.
+    ///
+    /// # Errors
+    ///
+    /// - `NotInitialized` — the factory has no governor address yet, so there
+    ///   is nothing to read a fee from.
+    /// - `GovernorNotResponding` — the governor is archived, uninitialised, or
+    ///   the cross-contract call failed.
+    ///
+    /// Both cases previously returned a hardcoded `30`, which a caller could
+    /// not distinguish from a governor genuinely configured at 30 bps. That is
+    /// the same situation in which `create_stream` fails loudly with
+    /// `GovernorNotResponding`, so a UI quoting a fee and a transaction
+    /// charging one could disagree without anything appearing to go wrong.
+    /// Callers that want the old lenient behaviour should use
+    /// [`Self::protocol_fee_bps_or_default`].
+    pub fn protocol_fee_bps(env: Env) -> Result<u32, Error> {
         let governor: Option<Address> = env.storage().instance().get(&DataKey::GovernorAddress);
-        match governor {
-            Some(governor) => governance::config(&env, &governor)
-                .map(|c| c.fee_bps)
-                .unwrap_or(30),
-            None => 30,
-        }
+        let governor = governor.ok_or(Error::NotInitialized)?;
+        governance::config(&env, &governor).map(|c| c.fee_bps)
+    }
+
+    /// Read-only: current protocol fee, falling back to `default_bps` when it
+    /// cannot be read.
+    ///
+    /// For callers that would rather display an approximate fee than nothing —
+    /// but which are choosing that tradeoff explicitly, and supply the fallback
+    /// themselves rather than inheriting a constant buried in the factory.
+    pub fn protocol_fee_bps_or_default(env: Env, default_bps: u32) -> u32 {
+        Self::protocol_fee_bps(env).unwrap_or(default_bps)
     }
 
     /// Update the stored stream WASM hash.
@@ -607,10 +620,14 @@ impl DripFactory {
     ///
     /// Combines `is_paused` and `protocol_fee_bps` into a single view call
     /// to save a round-trip for UI/indexer health checks.
+    ///
+    /// `protocol_fee_bps` is `None` when the fee could not be read. The call
+    /// still succeeds in that case, because the pause state is independently
+    /// useful and a governor outage should not hide it.
     pub fn factory_status(env: Env) -> FactoryStatus {
         FactoryStatus {
             is_paused: Self::is_paused(env.clone()),
-            protocol_fee_bps: Self::protocol_fee_bps(env),
+            protocol_fee_bps: Self::protocol_fee_bps(env).ok(),
         }
     }
 

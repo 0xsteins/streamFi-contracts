@@ -23,6 +23,14 @@ pub fn config(env: &Env, governor: &Address) -> Result<GovernorConfig, Error> {
 /// `rate_per_sec` and, for fixed-duration streams, the declared length must
 /// respect the protocol parameters DripGovernor holds.
 ///
+/// # Design Note: Creation vs Extension Bounds
+///
+/// This duration bound is enforced at stream creation time to cap initial upfront
+/// commitment and scheduling horizons. Post-creation lifetime extensions via
+/// `DripStream::extend_duration` and `DripStream::top_up_and_extend` are
+/// intentionally unbounded by this initial creation cap, allowing ongoing streams
+/// (e.g. payroll, recurring subscriptions) to continue without redeploying per ADR-001.
+///
 /// # Errors
 ///
 /// This function uses `checked_sub` to safely compute stream duration, ensuring
@@ -47,6 +55,12 @@ pub fn enforce_bounds(
     // so an open-ended stream escapes every bound. The deposit is transferred
     // immediately and, when clawback is disabled, cannot be recovered before
     // `start_time` — which is to say, never in practice.
+    //
+    // `max_duration_seconds` is reused as the ceiling rather than introducing a
+    // separate governor parameter: a stream that cannot begin for longer than
+    // the protocol's longest permitted stream is locking funds beyond anything
+    // a legitimate stream would. Reusing it also keeps this fix inside the
+    // factory instead of migrating the governor's stored config.
     let start_offset = start_time.saturating_sub(now);
     if start_offset > config.max_duration_seconds {
         return Err(Error::StartTimeTooFarInFuture);
@@ -86,10 +100,20 @@ mod tests {
         }
     }
 
+    // ── start_time upper bound (#342) ───────────────────────────────────────
+    //
+    // `create_stream` rejects a backdated start, but nothing bounded how far
+    // ahead one could be. With `end_time = 0` the duration checks below never
+    // run, so `start_time = now + 100 years` was accepted: the deposit moves
+    // immediately and, with clawback disabled, cannot be recovered before the
+    // stream starts.
+
     #[test]
     fn open_ended_stream_far_in_the_future_is_rejected() {
         let env = Env::default();
         let cfg = config(&env);
+
+        // 100 years out, open-ended — the exact case from the issue.
         let start = NOW + 100 * 365 * DAY;
 
         assert_eq!(
@@ -100,6 +124,8 @@ mod tests {
 
     #[test]
     fn fixed_duration_stream_far_in_the_future_is_also_rejected() {
+        // The bound applies regardless of end_time; a fixed-duration stream
+        // scheduled beyond the ceiling locks funds just as long.
         let env = Env::default();
         let cfg = config(&env);
         let start = NOW + 100 * 365 * DAY;
@@ -112,6 +138,8 @@ mod tests {
 
     #[test]
     fn start_exactly_at_the_ceiling_is_allowed() {
+        // The bound is inclusive: an offset equal to max_duration_seconds is
+        // the largest legitimate schedule, not one past it.
         let env = Env::default();
         let cfg = config(&env);
         let start = NOW + cfg.max_duration_seconds;
@@ -133,6 +161,7 @@ mod tests {
 
     #[test]
     fn immediate_start_is_unaffected() {
+        // The overwhelmingly common case must not regress.
         let env = Env::default();
         let cfg = config(&env);
 
@@ -142,11 +171,16 @@ mod tests {
 
     #[test]
     fn a_start_time_already_in_the_past_does_not_underflow() {
+        // `create_stream` rejects backdated starts before reaching here, but
+        // enforce_bounds is also called from the batch path and must not panic
+        // on a past timestamp. saturating_sub yields a zero offset.
         let env = Env::default();
         let cfg = config(&env);
 
         assert_eq!(enforce_bounds(&cfg, 1, NOW - 5 * DAY, 0, NOW), Ok(()));
     }
+
+    // ── Existing bounds still hold ──────────────────────────────────────────
 
     #[test]
     fn rate_above_the_maximum_is_still_rejected() {

@@ -43,5 +43,12 @@ pub enum Error {
     /// The token address is invalid (e.g. the all-zero Stellar account address).
     InvalidToken = 28,
     /// The stream start is too far in the future for the protocol's allowed scheduling window.
+    /// `start_time` is further ahead than the protocol's maximum stream
+    /// duration allows.
+    ///
+    /// An unbounded `start_time` locks the deposit for as long as the caller
+    /// likes: with `end_time = 0` no duration bound applies, and if clawback
+    /// is disabled there is no way to recover the funds before the stream
+    /// starts.
     StartTimeTooFarInFuture = 29,
 }

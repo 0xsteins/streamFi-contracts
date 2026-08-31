@@ -186,6 +186,17 @@ fn resume_unpaused_panics() {
     assert_eq!(result, Err(Ok(Error::NotPaused)));
 }
 
+#[test]
+fn pause_before_start_rejected() {
+    let s = Setup::new(100, 3600, false);
+    let mut ledger = s.env.ledger().get();
+    ledger.timestamp -= 1;
+    s.env.ledger().set(ledger);
+
+    let result = s.client.try_pause(&s.sender);
+    assert_eq!(result, Err(Ok(Error::StreamNotStarted)));
+}
+
 // ── Cancel ────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -210,6 +221,29 @@ fn cancel_halfway_splits_correctly() {
     // Sender gets 180_000 refund
     assert_eq!(s.token.balance(&s.recipient) - recipient_before, 180_000);
     assert_eq!(s.token.balance(&s.sender) - sender_before, 180_000);
+}
+
+#[test]
+fn cancel_advances_withdrawn_by_the_payout() {
+    let s = Setup::new(100, 3600, false);
+    s.advance_secs(1800); // halfway → 180_000 earned, none pulled via withdraw()
+    s.client.cancel(&s.sender);
+
+    // `cancel` paid the recipient 180_000 directly. Post-cancel `withdrawn`
+    // must reflect what the recipient received, not just withdraw() pulls.
+    assert_eq!(s.client.info().withdrawn, 180_000);
+}
+
+#[test]
+fn cancel_advances_withdrawn_on_top_of_prior_withdrawals() {
+    let s = Setup::new(100, 3600, false);
+    s.advance_secs(1800); // 180_000 earned
+    let pulled = s.client.withdraw(&50_000);
+    assert_eq!(pulled, 50_000);
+    s.client.cancel(&s.sender);
+
+    // 50_000 via withdraw() + 130_000 paid out by cancel = 180_000 total.
+    assert_eq!(s.client.info().withdrawn, 180_000);
 }
 
 #[test]
@@ -617,6 +651,52 @@ fn info_reflects_pause_state() {
     assert!(inf.paused_at > 0);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn uninitialized_stream_info_returns_not_initialized() {
+    let env = Env::default();
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    client.info();
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn uninitialized_stream_withdrawable_returns_not_initialized() {
+    let env = Env::default();
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    client.withdrawable();
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn uninitialized_stream_streamed_total_returns_not_initialized() {
+    let env = Env::default();
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    client.streamed_total();
+}
+
+#[test]
+fn uninitialized_stream_mutations_return_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+    let caller = Address::generate(&env);
+
+    assert_eq!(client.try_withdraw(&1), Err(Ok(Error::NotInitialized)));
+    assert_eq!(client.try_cancel(&caller), Err(Ok(Error::NotInitialized)));
+}
+
 // ── Edge cases ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -898,6 +978,8 @@ fn force_cancel_commits_state_and_drains_balance() {
     // Only the 1_000s streamed before the pause is owed to the recipient.
     assert_eq!(paid_to_recipient, 100_000);
     assert_eq!(paid_to_sender + paid_to_recipient, escrowed);
+    // `withdrawn` reflects the tokens the recipient received in force_cancel.
+    assert_eq!(s.client.info().withdrawn, 100_000);
 }
 
 /// Every value-moving entry point must reject an already-cancelled stream.
@@ -1087,14 +1169,15 @@ fn set_operator_rejects_on_cancelled_stream() {
 }
 
 #[test]
-fn set_operator_replaces_previous() {
+fn set_operator_requires_revoke_before_replacement() {
     let s = Setup::new(100, 3600, false);
     let op1 = Address::generate(&s.env);
     let op2 = Address::generate(&s.env);
     s.client.set_operator(&s.sender, &op1);
     assert_eq!(s.client.operator(), Some(op1.clone()));
-    s.client.set_operator(&s.sender, &op2);
-    assert_eq!(s.client.operator(), Some(op2));
+    let result = s.client.try_set_operator(&s.sender, &op2);
+    assert_eq!(result, Err(Ok(Error::OperatorAlreadySet)));
+    assert_eq!(s.client.operator(), Some(op1));
 }
 
 #[test]
@@ -1125,6 +1208,41 @@ fn revoke_operator_rejects_on_cancelled_stream() {
     s.client.cancel(&s.sender);
     let result = s.client.try_revoke_operator(&s.sender);
     assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn operator_events_emit_correct_topic_shape_and_sequence() {
+    let s = Setup::new(100, 3600, false);
+    let operator = Address::generate(&s.env);
+
+    s.client.set_operator(&s.sender, &operator);
+    s.client.revoke_operator(&s.sender);
+
+    assert_eq!(s.client.event_sequence(), 3);
+
+    let all_events = s.env.events().all();
+    let stream_events: std::vec::Vec<_> = all_events
+        .iter()
+        .filter(|(contract, _, _)| contract == &s.client.address)
+        .collect();
+
+    assert_eq!(stream_events.len(), 3);
+
+    // Event 1: set_op
+    assert_eq!(
+        stream_events[1].1,
+        (symbol_short!("set_op"), s.sender.clone(), 2_u64).into_val(&s.env)
+    );
+    let set_op_data: Address = stream_events[1].2.try_into_val(&s.env).unwrap();
+    assert_eq!(set_op_data, operator);
+
+    // Event 2: rm_op with ((rm_op, sender, 3), ())
+    assert_eq!(
+        stream_events[2].1,
+        (symbol_short!("rm_op"), s.sender.clone(), 3_u64).into_val(&s.env)
+    );
+    let rm_op_data: () = stream_events[2].2.try_into_val(&s.env).unwrap();
+    assert_eq!(rm_op_data, ());
 }
 
 // ── Operator exercises sender-gated functions ──────────────────────────────
@@ -1394,3 +1512,134 @@ fn sender_still_can_pause_after_setting_operator() {
 // satisfy this auth because they are not the recipient. This is already covered
 // by the existing withdraw tests (which always pass recipient auth) and would
 // require disabling mock_all_auths() to test negative cases properly.
+// ── State storage: save() writes only Config; legacy keys are cleaned ─────────
+//
+// `save()` used to mirror the 9 individual per-field keys alongside the
+// consolidated `Config` on every mutation, but `load()` reads `Config` on its
+// fast path (always true for post-consolidation streams). Those mirrors were
+// never read — pure write/rent overhead on every state mutation. `save()` now
+// writes only `Config` and, on the first `save()` of a pre-consolidation
+// stream, removes the legacy keys one-time.
+
+#[test]
+fn initialize_writes_only_config_and_not_legacy_keys() {
+    let s = Setup::new(100, 3600, false);
+
+    let (has_config, has_sender, has_withdrawn, has_flags) =
+        s.env.as_contract(&s.client.address, || {
+            let storage = s.env.storage().instance();
+            (
+                storage.has(&DataKey::Config),
+                storage.has(&DataKey::Sender),
+                storage.has(&DataKey::Withdrawn),
+                storage.has(&DataKey::Flags),
+            )
+        });
+
+    assert!(
+        has_config,
+        "consolidated Config must be written on initialize"
+    );
+    assert!(!has_sender, "legacy Sender key must not be written");
+    assert!(!has_withdrawn, "legacy Withdrawn key must not be written");
+    assert!(!has_flags, "legacy Flags key must not be written");
+
+    // initialize() must still expose the full state via load()/info().
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+    assert_eq!(info.rate_per_second, 100);
+    assert!(!info.is_clawback_enabled());
+}
+
+#[test]
+fn state_mutation_writes_only_config_not_legacy_keys() {
+    let s = Setup::new(100, 3600, false);
+    s.advance_secs(100);
+    s.client.withdraw(&10_000); // drives state::save
+
+    let (has_config, has_sender, has_withdrawn) = s.env.as_contract(&s.client.address, || {
+        let storage = s.env.storage().instance();
+        (
+            storage.has(&DataKey::Config),
+            storage.has(&DataKey::Sender),
+            storage.has(&DataKey::Withdrawn),
+        )
+    });
+    assert!(has_config, "Config must be present after a mutation");
+    assert!(
+        !has_sender,
+        "mutation must not resurrect the legacy Sender key"
+    );
+    assert!(
+        !has_withdrawn,
+        "mutation must not resurrect the legacy Withdrawn key"
+    );
+
+    // The mutation's effect must still be durable through Config.
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+    assert_eq!(info.withdrawn, 10_000);
+}
+
+#[test]
+fn save_migrates_legacy_keys_to_config_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let stream_id = env.register_contract(None, DripStream);
+
+    // Simulate a pre-consolidation stream: only the per-field keys exist.
+    env.as_contract(&stream_id, || {
+        let storage = env.storage().instance();
+        storage.set(&DataKey::Sender, &sender);
+        storage.set(&DataKey::Recipient, &recipient);
+        storage.set(&DataKey::Token, &token_addr);
+        storage.set(&DataKey::RatePerSecond, &100_i128);
+        storage.set(&DataKey::StartTime, &1_000_000_u64);
+        storage.set(&DataKey::EndTime, &1_003_600_u64);
+        storage.set(&DataKey::Withdrawn, &0_i128);
+        storage.set(&DataKey::PausedAt, &0_u64);
+        storage.set(&DataKey::Flags, &0_u32);
+        assert!(!storage.has(&DataKey::Config));
+    });
+
+    // First save() supersedes the legacy keys and writes Config.
+    env.as_contract(&stream_id, || {
+        crate::state::save(
+            &env,
+            &crate::storage::StreamInfo {
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token: token_addr.clone(),
+                rate_per_second: 100,
+                start_time: 1_000_000,
+                end_time: 1_003_600,
+                withdrawn: 0,
+                paused_at: 0,
+                flags: 0,
+            },
+        );
+    });
+
+    // Legacy keys removed, Config present, load() returns the right state.
+    env.as_contract(&stream_id, || {
+        let storage = env.storage().instance();
+        assert!(storage.has(&DataKey::Config));
+        assert!(!storage.has(&DataKey::Sender));
+        assert!(!storage.has(&DataKey::Recipient));
+        assert!(!storage.has(&DataKey::Withdrawn));
+        assert!(!storage.has(&DataKey::Flags));
+
+        let info = crate::state::load(&env);
+        assert_eq!(info.rate_per_second, 100);
+        assert_eq!(info.sender, sender);
+        assert_eq!(info.recipient, recipient);
+    });
+}
