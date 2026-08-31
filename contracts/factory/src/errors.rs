@@ -42,6 +42,7 @@ pub enum Error {
     InvalidDuration = 27,
     /// The token address is invalid (e.g. the all-zero Stellar account address).
     InvalidToken = 28,
+    /// The stream start is too far in the future for the protocol's allowed scheduling window.
     /// `start_time` is further ahead than the protocol's maximum stream
     /// duration allows.
     ///
