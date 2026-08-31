@@ -336,6 +336,15 @@ impl DripStream {
             .checked_sub(info.paused_at)
             .ok_or(Error::ArithmeticOverflow)?;
 
+        // A stream that stays paused beyond the protocol's safe grace window is
+        // at risk of instance-storage archival; reject the resume before the host
+        // turns this into the opaque "entry archived" error path. The same
+        // threshold is used by `force_cancel()` to keep the contract-level safety
+        // policy consistent across both recovery flows.
+        if paused_duration > ttl::MAX_PAUSE_SECS {
+            return Err(Error::PauseThresholdNotMet);
+        }
+
         // Shift start_time forward by paused duration so paused time doesn't
         // count; end_time is shifted by the same amount on resume so the
         // contracted duration is preserved in wall-clock terms.
@@ -617,8 +626,6 @@ impl DripStream {
     }
 
     fn _force_cancel(env: &Env) -> Result<(), Error> {
-        const PAUSE_THRESHOLD_SECS: u64 = 2_592_000; // 30 days
-
         ttl::bump(env);
 
         let info = state::load(env);
@@ -629,7 +636,7 @@ impl DripStream {
 
         let now = env.ledger().timestamp();
         let paused_secs = now.saturating_sub(info.paused_at);
-        if paused_secs < PAUSE_THRESHOLD_SECS {
+        if paused_secs < ttl::MAX_PAUSE_SECS {
             return Err(Error::PauseThresholdNotMet);
         }
 
